@@ -73,7 +73,7 @@ def tensor_upscale_then_center_crop(frame_tensor: torch.Tensor, scale: int, tW: 
         pad_t = max(0, (tH - sH) // 2)
         pad_b = max(0, tH - sH - pad_t)
         upscaled_tensor = F.pad(upscaled_tensor, (pad_l, pad_r, pad_t, pad_b), mode='constant', value=0)
-
+    
     l = max(0, (upscaled_tensor.shape[3] - tW) // 2)
     t = max(0, (upscaled_tensor.shape[2] - tH) // 2)
     cropped_tensor = upscaled_tensor[:, :, t:t + tH, l:l + tW]
@@ -255,11 +255,11 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
     start_time = time.time()
-
+    
     _frames = frames
     _device = pipe.device
     dtype = pipe.torch_dtype
-
+    
     if enable_debug:
         log(f"[FlashVSR] Debug Mode: Enabled", message_type='info')
         log(f"[FlashVSR] Device: {_device}", message_type='info')
@@ -288,7 +288,7 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
             if enable_debug:
                 tile_start = time.time()
                 vram_start = torch.cuda.memory_allocated() / 1024**3 if torch.cuda.is_available() else 0
-
+                
             log(f"[FlashVSR] Processing tile {i+1}/{len(tile_coords)}: coords ({x1},{y1}) to ({x2},{y2})", message_type='info')
             input_tile = _frames[:, y1:y2, x1:x2, :]
             
@@ -309,7 +309,7 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
                 tile_end = time.time()
                 vram_end = torch.cuda.memory_allocated() / 1024**3 if torch.cuda.is_available() else 0
                 log(f"   Tile {i+1} done in {tile_end - tile_start:.2f}s. VRAM: {vram_start:.2f}GB -> {vram_end:.2f}GB", message_type='info')
-
+            
             mask_nchw = create_feather_mask(
                 (processed_tile_cpu.shape[1], processed_tile_cpu.shape[2]),
                 tile_overlap * scale
@@ -351,7 +351,7 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
     total_time = end_time - start_time
     fps = frames.shape[0] / total_time if total_time > 0 else 0
     log(f"[FlashVSR] Done in {total_time:.2f}s ({fps:.2f} FPS).", message_type='finish')
-
+    
     if torch.cuda.is_available():
         peak_memory = torch.cuda.max_memory_reserved() / 1024**3
         log(f"[FlashVSR] Peak VRAM used: {peak_memory:.2f} GB", message_type='info')

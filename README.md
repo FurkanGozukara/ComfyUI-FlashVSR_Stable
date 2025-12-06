@@ -49,7 +49,7 @@ If enabled, models will be moved to RAM (CPU) after processing instead of remain
 ```bash
 cd ComfyUI/custom_nodes
 git clone https://github.com/naxci1/ComfyUI-FlashVSR_Stable.git
-python -m pip install -r ComfyUI-FlashVSR_Ultra_Fast/requirements.txt
+python -m pip install -r ComfyUI-FlashVSR_Stable/requirements.txt
 ```
 📢: For Turing or older GPUs, please install `triton<3.3.0`:  
 

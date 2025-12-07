@@ -1,8 +1,15 @@
-# ComfyUI-FlashVSR_Ultra_Fast
+# ComfyUI-FlashVSR_Stable
 Running FlashVSR on lower VRAM without any artifacts.
 
 ## Changelog
-#### 06.12.2025
+
+#### 2025-12-07
+- **Optimization**: Added `torch.cuda.ipc_collect()` for better memory cleanup.
+- **New Feature**: Added `attention_mode` selection with support for `flash_attention_2`, `sdpa`, `sparse_sage`, and `block_sparse` backends.
+- **New Feature**: Implemented VAE spatial tiling to reduce VRAM usage during decoding (experimental).
+- **Refactor**: Cleaned up code and improved error handling for imports.
+
+#### 2025-12-06
 - **Bug Fix**: Fixed a shape mismatch error for small input frames by implementing correct padding logic.
 - **Optimization**: VRAM is now immediately freed at the start of processing to prevent OOM errors.
 - **New Feature**: Added `enable_debug` option for extensive logging (input shapes, tile stats, VRAM usage, processing time).
@@ -10,10 +17,6 @@ Running FlashVSR on lower VRAM without any artifacts.
 - **Enhancement**: Added accurate FPS calculation and peak VRAM reporting (using `max_memory_reserved`) to the logs.
 - **Optimization**: Replaced `einops` operations with native PyTorch ops for potential performance gains.
 - **Optimization**: Added "Conv3d memory workaround" for improved compatibility with newer PyTorch versions.
-- **Optimization**: Added `torch.cuda.ipc_collect()` for better memory cleanup.
-- **New Feature**: Added `attention_mode` selection with support for `flash_attention_2`, `sdpa`, `sparse_sage`, and `block_sparse` backends.
-- **New Feature**: Implemented VAE spatial tiling to reduce VRAM usage during decoding (experimental).
-- **Refactor**: Cleaned up code and improved error handling for imports.
 
 #### 2025-10-24
 - Added long video pipeline that significantly reduces VRAM usage when upscaling long videos.
@@ -56,8 +59,8 @@ Select the attention backend. Options include `sparse_sage`, `block_sparse`, `fl
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/lihaoyun6/ComfyUI-FlashVSR_Ultra_Fast.git
-python -m pip install -r ComfyUI-FlashVSR_Ultra_Fast/requirements.txt
+git clone https://github.com/naxci1/ComfyUI-FlashVSR_Stable.git
+python -m pip install -r ComfyUI-FlashVSR_Stable/requirements.txt
 ```
 📢: For Turing or older GPUs, please install `triton<3.3.0`:  
 

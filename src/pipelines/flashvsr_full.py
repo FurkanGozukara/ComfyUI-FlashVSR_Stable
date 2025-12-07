@@ -299,7 +299,7 @@ class FlashVSRFullPipeline(BasePipeline):
     def decode_video(self, latents, tiled=True, tile_size=(34, 34), tile_stride=(18, 16)):
         frames = self.vae.decode(latents, device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
         return frames
-    
+
     def offload_model(self, keep_vae=False):
         self.dit.clear_cross_kv()
         self.prompt_emb_posi['stats'] = "offload"
@@ -340,6 +340,7 @@ class FlashVSRFullPipeline(BasePipeline):
         color_fix = True,
         unload_dit = False,
         force_offload = False,
+        enable_debug_logging = False, # Pass debug flag if needed
     ):
         # 只接受 cfg=1.0（与原代码一致）
         assert cfg_scale == 1.0, "cfg_scale must be 1.0"
@@ -370,7 +371,7 @@ class FlashVSRFullPipeline(BasePipeline):
 
         process_total_num = (num_frames - 1) // 8 - 2
         is_stream = True
-        
+
         if self.prompt_emb_posi['stats'] == "offload":
             self.init_cross_kv(context_tensor=self.prompt_emb_posi['context'])
         self.load_models_to_device(["dit", "vae"])
@@ -382,7 +383,7 @@ class FlashVSRFullPipeline(BasePipeline):
 
         latents_total = []
         self.vae.clear_cache()
-        
+
         with torch.no_grad():
             for cur_process_idx in progress_bar_cmd(range(process_total_num)):
                 if cur_process_idx == 0:
@@ -417,7 +418,7 @@ class FlashVSRFullPipeline(BasePipeline):
                             for layer_idx in range(len(LQ_latents)):
                                 LQ_latents[layer_idx] = torch.cat([LQ_latents[layer_idx], cur[layer_idx]], dim=1)
                     cur_latents = latents[:, :, 4+cur_process_idx*2:6+cur_process_idx*2, :, :]
-                
+
                 # 推理（无 motion_controller / vace）
                 noise_pred_posi, pre_cache_k, pre_cache_v = model_fn_wan_video(
                     self.dit,
@@ -442,24 +443,26 @@ class FlashVSRFullPipeline(BasePipeline):
                 # 更新 latent
                 cur_latents = cur_latents - noise_pred_posi
                 latents_total.append(cur_latents)
-            
+
             if hasattr(self.dit, "LQ_proj_in"):
                 self.dit.LQ_proj_in.clear_cache()
-            
+
             if unload_dit and hasattr(self, 'dit') and not next(self.dit.parameters()).is_cpu:
-                print("[FlashVSR] Offloading DiT to the CPU to free up VRAM...")
+                if enable_debug_logging:
+                    print("[FlashVSR] Offloading DiT to the CPU to free up VRAM...")
                 self.offload_model(keep_vae=True)
-            
+
             latents = torch.cat(latents_total, dim=2)
-            
+
             # Decode
-            print("[FlashVSR] Starting VAE decoding...")
+            if enable_debug_logging:
+                print("[FlashVSR] Starting VAE decoding...")
             frames = self.decode_video(latents, **tiler_kwargs)
-            
+
             self.vae.clear_cache()
             if force_offload:
                 self.offload_model()
-                
+
             # 颜色校正（wavelet）
             try:
                 if color_fix:
@@ -472,7 +475,7 @@ class FlashVSRFullPipeline(BasePipeline):
                     )
             except:
                 pass
-        
+
         return frames[0]
 
 
@@ -488,7 +491,7 @@ class TeaCache:
         self.rel_l1_thresh = rel_l1_thresh
         self.previous_residual = None
         self.previous_hidden_states = None
-        
+
         self.coefficients_dict = {
             "Wan2.1-T2V-1.3B": [-5.21862437e+04, 9.23041404e+03, -5.28275948e+02, 1.36987616e+01, -4.99875664e-02],
             "Wan2.1-T2V-14B":  [-3.03318725e+05, 4.90537029e+04, -2.65530556e+03, 5.87365115e+01, -3.15583525e-01],

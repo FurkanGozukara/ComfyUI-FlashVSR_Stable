@@ -310,16 +310,22 @@ class cqdm:
 
             # Show a text progress bar in the log
             perc = (self.step_idx / self.total) * 100
-            bar_len = 25
+            bar_len = 30
             filled = int(bar_len * self.step_idx // self.total)
             bar = '█' * filled + '░' * (bar_len - filled)
 
-            msg = f"{self.desc}: {self.step_idx}/{self.total} [{bar}] {perc:.1f}%"
+            # Format elapsed/remaining time
+            elapsed = time.time() - self.start_time
+            rate = self.step_idx / elapsed if elapsed > 0 else 0
+            remaining = (self.total - self.step_idx) / rate if rate > 0 else 0
+
+            msg = f"{self.desc}: {self.step_idx}/{self.total} |{bar}| {perc:.1f}% [{elapsed:.0f}s<{remaining:.0f}s, {rate:.1f}it/s]"
 
             if self.enable_debug:
                 step_end = time.time()
                 step_time = step_end - step_start
-                msg += f" | {step_time:.2f}s/step"
+                # Detailed logging if debug is on (might span lines)
+                msg += f" (Step: {step_time:.2f}s)"
                 log_resource_usage(prefix=msg, in_place=True)
             else:
                 # Use logging to print progress to console in place
@@ -330,6 +336,7 @@ class cqdm:
             return val
         except StopIteration:
             total_time = time.time() - self.start_time
+            # Only print finish message if not already done by progress bar
             if self.enable_debug:
                 log(f"Loop '{self.desc}' finished in {total_time:.2f}s", message_type='finish', icon="✅")
             raise
@@ -375,34 +382,7 @@ def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_siz
         for i, (x1, y1, x2, y2) in enumerate(cqdm(tile_coords, desc="Processing Tiles", enable_debug=enable_debug)):
             tile_start = time.time()
             if enable_debug:
-                # If printing in place, we might overwrite this log if not careful.
-                # cqdm uses \r. So if we log something else here, it might be overwritten by next cqdm update.
-                # However, enable_debug log here uses newline. So it will push cqdm line up?
-                # Actually, `cqdm` updates at end of loop iteration (when `next` is called).
-                # `log` prints with newline.
-                # So:
-                # 1. loop start. `cqdm` prints bar at `next()`.
-                # 2. `log` prints "Processing tile ...". Newline.
-                # 3. Code runs.
-                # 4. Loop repeats. `cqdm` prints bar on NEW line?
-                # Ah, `\r` only works on current line. If we printed a newline, `\r` goes to start of new line.
-                # So if we log inside the loop with `\n`, the progress bar will appear on each new line.
-                # The user said "not on a new line each time".
-                # If debug is enabled, we WANT detailed logs, so new lines are expected for the detailed logs.
-                # But the progress bar itself?
-                # If we want the progress bar to stay at bottom, we can't easily do that with standard print stream if we keep appending logs.
-                # But user said "Expand the logs... Provide plenty of detail" AND "progress bar... single line".
-                # These are conflicting if strictly interpreted in a scrolling log.
-                # Compromise: The progress bar line updates in place. Detailed logs appear above it?
-                # No, detailed logs appear, then progress bar redraws?
-                # If `enable_debug` is False, we don't log inside the loop, so progress bar is single line.
-                # If `enable_debug` is True, we log "Processing tile X".
-                # `cqdm` prints bar.
-                # If we `log`, it prints newline.
-                # Then `cqdm` updates.
-                pass
-
-            # ... (rest of logic)
+                log(f"Processing tile {i+1}/{len(tile_coords)}: ({x1},{y1}) -> ({x2},{y2})", message_type='info', icon="🔄")
             
             input_tile = _frames[:, y1:y2, x1:x2, :]
             
@@ -427,10 +407,7 @@ def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_siz
             if enable_debug:
                 tile_end = time.time()
                 tile_time = tile_end - tile_start
-                # log(f"Tile {i+1} completed ...")
-                # This log will break the progress bar single-line if cqdm printed it.
-                # But cqdm prints at start of iteration.
-                pass
+                log(f"Tile {i+1} completed in {tile_time:.2f}s", message_type='info', icon="⏱️")
             
             mask_nchw = create_feather_mask(
                 (processed_tile_cpu.shape[1], processed_tile_cpu.shape[2]),
@@ -490,12 +467,11 @@ def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_siz
         clean_vram()
 
     if is_single_frame_input and frames.shape[0] == 1:
-        if frames.shape[0] == 1:
-            final_output = final_output.to("cpu")
-            stacked_image_tensor = torch.median(final_output, dim=0).values.unsqueeze(0).float()
-            del final_output
-            clean_vram()
-            return stacked_image_tensor
+        final_output = final_output.to("cpu")
+        stacked_image_tensor = torch.median(final_output, dim=0).values.unsqueeze(0).float()
+        del final_output
+        clean_vram()
+        return stacked_image_tensor
 
     return final_output[:frames.shape[0], :, :, :]
 
@@ -625,8 +601,27 @@ class FlashVSRNodeInitPipe:
             torch.cuda.set_device(_device)
             
         wan_video_dit.ATTENTION_MODE = attention_mode
+
+        # Auto bfloat16 detection
+        if precision == "auto":
+            if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+                precision = "bf16"
+                log("Auto-detected bf16 support.", message_type='info', icon="⚙️")
+            else:
+                precision = "fp16"
+                log("Defaulting to fp16.", message_type='info', icon="⚙️")
             
-        pipe = init_pipeline(model, mode, _device, torch.float16)
+        dtype_map = {
+            "fp32": torch.float32,
+            "fp16": torch.float16,
+            "bf16": torch.bfloat16,
+        }
+        try:
+            dtype = dtype_map[precision]
+        except:
+            dtype = torch.bfloat16
+
+        pipe = init_pipeline(model, mode, _device, dtype, alt_vae=alt_vae)
         return((pipe, force_offload),)
 
 class FlashVSRNodeAdv:
@@ -786,7 +781,7 @@ class FlashVSRNode:
                 }),
                 "enable_debug": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "Enable verbose logging to console. Shows VRAM usage, step times, tile info, and detailed progress."
+                    "tooltip": "Enable extensive logging for debugging."
                 }),
                 "keep_models_on_cpu": ("BOOLEAN", {
                     "default": True,

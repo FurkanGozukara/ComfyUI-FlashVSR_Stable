@@ -2,12 +2,17 @@
 Running FlashVSR on lower VRAM without any artifacts.
 
 ## Changelog
-#### 2025-12-06
+#### 06.12.2025
 - **Bug Fix**: Fixed a shape mismatch error for small input frames by implementing correct padding logic.
 - **Optimization**: VRAM is now immediately freed at the start of processing to prevent OOM errors.
 - **New Feature**: Added `enable_debug` option for extensive logging (input shapes, tile stats, VRAM usage, processing time).
 - **New Feature**: Added `keep_models_on_cpu` option to keep models in RAM (CPU) instead of VRAM, which is useful for GPUs with limited VRAM (e.g., 16GB).
 - **Enhancement**: Added accurate FPS calculation and peak VRAM reporting (using `max_memory_reserved`) to the logs.
+- **Optimization**: Replaced `einops` operations with native PyTorch ops for potential performance gains.
+- **Optimization**: Added "Conv3d memory workaround" for improved compatibility with newer PyTorch versions.
+- **Optimization**: Added `torch.cuda.ipc_collect()` for better memory cleanup.
+- **New Feature**: Added `attention_mode` selection with support for `flash_attention_2`, `sdpa`, `sparse_sage`, and `block_sparse` backends.
+- **Refactor**: Cleaned up code and improved error handling for imports.
 
 #### 2025-10-24
 - Added long video pipeline that significantly reduces VRAM usage when upscaling long videos.
@@ -41,6 +46,8 @@ Unload DiT before decoding to reduce VRAM peak at the cost of speed.
 Enable extensive logging for debugging purposes. Displays detailed information about device status, input dimensions, and per-tile processing statistics.
 - **keep_models_on_cpu:**  
 If enabled, models will be moved to RAM (CPU) after processing instead of remaining in VRAM. This helps prevent OOM errors on systems with limited VRAM.
+- **attention_mode:**
+Select the attention backend. Options include `sparse_sage`, `block_sparse`, `flash_attention_2` (requires `flash-attn`), and `sdpa` (PyTorch default).
 
 ## Installation
 
@@ -48,8 +55,8 @@ If enabled, models will be moved to RAM (CPU) after processing instead of remain
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/naxci1/ComfyUI-FlashVSR_Stable.git
-python -m pip install -r ComfyUI-FlashVSR_Stable/requirements.txt
+git clone https://github.com/lihaoyun6/ComfyUI-FlashVSR_Ultra_Fast.git
+python -m pip install -r ComfyUI-FlashVSR_Ultra_Fast/requirements.txt
 ```
 📢: For Turing or older GPUs, please install `triton<3.3.0`:  
 

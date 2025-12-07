@@ -4,6 +4,12 @@ Running FlashVSR on lower VRAM without any artifacts.
 ## Changelog
 
 #### 07.12.2025
+- **VRAM Optimization**: Implemented auto-fallback for `process_chunk`. If OOM occurs, it automatically retries with `tiled_vae=True` and then `tiled_dit=True`, preventing crashes.
+- **Critical Fix**: Fixed a bug in the non-tiled processing path where output was undefined.
+- **Optimization**: Defer VAE loading in `full` mode until strictly necessary, significantly reducing peak VRAM usage.
+- **Optimization**: Added a proactive 90% VRAM usage warning.
+- **Refactor**: Rewrote progress bar to use single-line in-place updates (`\r`) for cleaner console output.
+- **Defaults**: Updated default settings for `FlashVSR Ultra-Fast` node to be safer for 16GB cards (`unload_dit=True`, `tiled` options enabled).
 - **Bug Fix**: Fixed `AttributeError` in `full` mode by adding a fallback mechanism to manually load the VAE model if the model manager fails.
 - **Bug Fix**: Fixed the progress bar to correctly display status in ComfyUI using the `cqdm` wrapper. Added text-based progress bar to logs.
 - **Sync**: Enabled VAE spatial tiling for `tiny` mode, bringing VRAM savings from `tiny-long` to the standard fast pipeline.

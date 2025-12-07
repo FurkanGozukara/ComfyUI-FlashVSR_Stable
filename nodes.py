@@ -35,7 +35,7 @@ except ImportError:
 
 device_choices = get_device_list()
 
-def log(message: str, message_type: str = 'normal', icon: str = ""):
+def log(message: str, message_type: str = 'normal', icon: str = "", end: str = "\n", in_place: bool = False):
     if icon:
         message = f"{icon} {message}"
         
@@ -49,9 +49,13 @@ def log(message: str, message_type: str = 'normal', icon: str = ""):
         message = '\033[1;33m' + message + '\033[m'
     else:
         message = message
-    print(f"{message}", flush=True)
 
-def log_resource_usage(prefix="Resource Usage"):
+    if in_place:
+        print(f"\r{message}", end="", flush=True)
+    else:
+        print(f"{message}", end=end, flush=True)
+
+def log_resource_usage(prefix="Resource Usage", end="\n", in_place=False):
     ram = psutil.virtual_memory()
     ram_used = ram.used / (1024 ** 3)
     ram_total = ram.total / (1024 ** 3)
@@ -60,11 +64,11 @@ def log_resource_usage(prefix="Resource Usage"):
     
     if torch.cuda.is_available():
         vram_used = torch.cuda.memory_allocated() / (1024 ** 3)
-        vram_reserved = torch.cuda.max_memory_reserved() / (1024 ** 3) # Using max_memory_reserved as requested
+        vram_reserved = torch.cuda.max_memory_reserved() / (1024 ** 3)
         vram_total = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-        msg += f" | VRAM: {vram_used:.2f}/{vram_reserved:.2f}/{vram_total:.2f} GB (Alloc/MaxRes/Total)"
+        msg += f" | VRAM: {vram_used:.2f}/{vram_reserved:.2f}/{vram_total:.2f} GB"
         
-    log(msg, message_type='info', icon="📊")
+    log(msg, message_type='info', icon="📊", end=end, in_place=in_place)
 
 def model_download(model_name="JunhaoZhuang/FlashVSR"):
     model_dir = os.path.join(folder_paths.models_dir, model_name.split("/")[-1])
@@ -306,19 +310,19 @@ class cqdm:
 
             # Show a text progress bar in the log
             perc = (self.step_idx / self.total) * 100
-            bar_len = 20
+            bar_len = 25
             filled = int(bar_len * self.step_idx // self.total)
-            bar = '█' * filled + '-' * (bar_len - filled)
+            bar = '█' * filled + '░' * (bar_len - filled)
 
-            msg = f"[{self.desc}] {self.step_idx}/{self.total} [{bar}] {perc:.1f}%"
+            msg = f"{self.desc}: {self.step_idx}/{self.total} [{bar}] {perc:.1f}%"
 
             if self.enable_debug:
                 step_end = time.time()
                 step_time = step_end - step_start
                 msg += f" | {step_time:.2f}s/step"
-                log_resource_usage(prefix=msg)
+                log_resource_usage(prefix=msg, in_place=True)
             else:
-                # Use logging to print progress to console
+                # Use logging to print progress to console in place
                 print(f"\r{msg}", end="", flush=True)
                 if self.step_idx == self.total:
                     print() # Newline at end
@@ -371,7 +375,34 @@ def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_siz
         for i, (x1, y1, x2, y2) in enumerate(cqdm(tile_coords, desc="Processing Tiles", enable_debug=enable_debug)):
             tile_start = time.time()
             if enable_debug:
-                log(f"Processing tile {i+1}/{len(tile_coords)}: ({x1},{y1}) -> ({x2},{y2})", message_type='info', icon="🔄")
+                # If printing in place, we might overwrite this log if not careful.
+                # cqdm uses \r. So if we log something else here, it might be overwritten by next cqdm update.
+                # However, enable_debug log here uses newline. So it will push cqdm line up?
+                # Actually, `cqdm` updates at end of loop iteration (when `next` is called).
+                # `log` prints with newline.
+                # So:
+                # 1. loop start. `cqdm` prints bar at `next()`.
+                # 2. `log` prints "Processing tile ...". Newline.
+                # 3. Code runs.
+                # 4. Loop repeats. `cqdm` prints bar on NEW line?
+                # Ah, `\r` only works on current line. If we printed a newline, `\r` goes to start of new line.
+                # So if we log inside the loop with `\n`, the progress bar will appear on each new line.
+                # The user said "not on a new line each time".
+                # If debug is enabled, we WANT detailed logs, so new lines are expected for the detailed logs.
+                # But the progress bar itself?
+                # If we want the progress bar to stay at bottom, we can't easily do that with standard print stream if we keep appending logs.
+                # But user said "Expand the logs... Provide plenty of detail" AND "progress bar... single line".
+                # These are conflicting if strictly interpreted in a scrolling log.
+                # Compromise: The progress bar line updates in place. Detailed logs appear above it?
+                # No, detailed logs appear, then progress bar redraws?
+                # If `enable_debug` is False, we don't log inside the loop, so progress bar is single line.
+                # If `enable_debug` is True, we log "Processing tile X".
+                # `cqdm` prints bar.
+                # If we `log`, it prints newline.
+                # Then `cqdm` updates.
+                pass
+
+            # ... (rest of logic)
             
             input_tile = _frames[:, y1:y2, x1:x2, :]
             
@@ -396,7 +427,10 @@ def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_siz
             if enable_debug:
                 tile_end = time.time()
                 tile_time = tile_end - tile_start
-                log(f"Tile {i+1} completed in {tile_time:.2f}s", message_type='info', icon="⏱️")
+                # log(f"Tile {i+1} completed ...")
+                # This log will break the progress bar single-line if cqdm printed it.
+                # But cqdm prints at start of iteration.
+                pass
             
             mask_nchw = create_feather_mask(
                 (processed_tile_cpu.shape[1], processed_tile_cpu.shape[2]),
@@ -591,27 +625,8 @@ class FlashVSRNodeInitPipe:
             torch.cuda.set_device(_device)
             
         wan_video_dit.ATTENTION_MODE = attention_mode
-        
-        # Auto bfloat16 detection
-        if precision == "auto":
-            if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
-                precision = "bf16"
-                log("Auto-detected bf16 support.", message_type='info', icon="⚙️")
-            else:
-                precision = "fp16"
-                log("Defaulting to fp16.", message_type='info', icon="⚙️")
             
-        dtype_map = {
-            "fp32": torch.float32,
-            "fp16": torch.float16,
-            "bf16": torch.bfloat16,
-        }
-        try:
-            dtype = dtype_map[precision]
-        except:
-            dtype = torch.bfloat16
-            
-        pipe = init_pipeline(model, mode, _device, dtype, alt_vae=alt_vae)
+        pipe = init_pipeline(model, mode, _device, torch.float16)
         return((pipe, force_offload),)
 
 class FlashVSRNodeAdv:

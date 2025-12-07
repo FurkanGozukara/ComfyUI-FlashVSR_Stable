@@ -360,7 +360,11 @@ class FlashVSRTinyPipeline(BasePipeline):
         # noise = noise.to(dtype=self.torch_dtype, device=self.device)
         latents = noise
 
+        process_total_num = (num_frames - 8 - 1) // 8 + 1 # Adjusted logic from tiny-long or similar
+        # tiny logic was: (num_frames - 1) // 8 - 2
+        # tiny-long logic: (num_frames - 1) // 8 - 2
         process_total_num = (num_frames - 1) // 8 - 2
+
         is_stream = True
 
         if self.prompt_emb_posi['stats'] == "offload":
@@ -373,10 +377,13 @@ class FlashVSRTinyPipeline(BasePipeline):
         if hasattr(self.dit, "LQ_proj_in"):
             self.dit.LQ_proj_in.clear_cache()
 
-        latents_total = []
-        self.TCDecoder.clean_mem()
+        frames_total = [] # Streaming accumulator
         LQ_pre_idx = 0
         LQ_cur_idx = 0
+        self.TCDecoder.clean_mem()
+
+        # Tile states for VAE
+        vae_tile_states = {}
 
         with torch.no_grad():
             for cur_process_idx in progress_bar_cmd(range(process_total_num)):
@@ -438,93 +445,102 @@ class FlashVSRTinyPipeline(BasePipeline):
 
                 # 更新 latent
                 cur_latents = cur_latents - noise_pred_posi
-                latents_total.append(cur_latents)
+
+                # Streaming Decode!
+                cur_LQ_frame = LQ_video[:,:,LQ_pre_idx:LQ_cur_idx,:,:].to(self.device)
+
+                if tiled: # tiled_vae logic
+                    B, C, T, H, W = cur_latents.shape
+
+                    l_tile_h, l_tile_w = tile_size
+                    l_stride_h, l_stride_w = tile_stride
+
+                    if isinstance(l_tile_h, tuple): l_tile_h = l_tile_h[0]
+                    if isinstance(l_tile_w, tuple): l_tile_w = l_tile_w[0]
+
+                    l_tile_h = max(l_tile_h // 8, 4)
+                    l_tile_w = max(l_tile_w // 8, 4)
+                    l_stride_h = max(l_stride_h // 8, 1)
+                    l_stride_w = max(l_stride_w // 8, 1)
+
+                    out_H = H * 8
+                    out_W = W * 8
+
+                    cur_frames = torch.zeros((B, 3, T, out_H, out_W), dtype=cur_latents.dtype, device='cpu')
+                    weights = torch.zeros((B, 3, T, out_H, out_W), dtype=cur_latents.dtype, device='cpu')
+
+                    for y in range(0, H, l_stride_h):
+                        for x in range(0, W, l_stride_w):
+                            y_end = min(y + l_tile_h, H)
+                            x_end = min(x + l_tile_w, W)
+
+                            if y_end <= y or x_end <= x: continue
+
+                            lat_tile = cur_latents[:, :, :, y:y_end, x:x_end]
+                            cond_y, cond_x = y * 8, x * 8
+                            cond_y_end, cond_x_end = y_end * 8, x_end * 8
+                            cond_tile = cur_LQ_frame[:, :, :, cond_y:cond_y_end, cond_x:cond_x_end]
+
+                            tile_key = (y, x)
+                            if tile_key not in vae_tile_states:
+                                vae_tile_states[tile_key] = [None] * len(self.TCDecoder.decoder)
+                            mem_tile = vae_tile_states[tile_key]
+
+                            out_tile, new_mem_tile = self.TCDecoder.decode_video(
+                                lat_tile.transpose(1, 2),
+                                parallel=False,
+                                show_progress_bar=False,
+                                cond=cond_tile,
+                                mem=mem_tile
+                            )
+                            vae_tile_states[tile_key] = new_mem_tile
+
+                            out_tile = out_tile.transpose(1, 2).to('cpu')
+                            th, tw = out_tile.shape[3], out_tile.shape[4]
+                            mask = torch.ones((1, 1, 1, th, tw), device='cpu')
+                            y_out, x_out = y * 8, x * 8
+                            cur_frames[:, :, :, y_out:y_out+th, x_out:x_out+tw] += out_tile * mask
+                            weights[:, :, :, y_out:y_out+th, x_out:x_out+tw] += mask
+
+                    weights[weights == 0] = 1.0
+                    cur_frames = cur_frames / weights
+                    cur_frames = cur_frames.mul_(2).sub_(1)
+                else:
+                    cur_frames = self.TCDecoder.decode_video(
+                        cur_latents.transpose(1, 2),
+                        parallel=False,
+                        show_progress_bar=False,
+                        cond=cur_LQ_frame
+                    ).transpose(1, 2).mul_(2).sub_(1)
+
+                # 颜色校正（wavelet）
+                try:
+                    if color_fix:
+                        cur_frames = self.ColorCorrector(
+                            cur_frames.to(device=self.device),
+                            cur_LQ_frame,
+                            clip_range=(-1, 1),
+                            chunk_size=16,
+                            method='adain'
+                        ).to('cpu') # Ensure back to CPU
+                except:
+                    pass
+
+                frames_total.append(cur_frames)
                 LQ_pre_idx = LQ_cur_idx
+
+                if unload_dit:
+                    del noise_pred_posi, cur_frames, cur_latents, cur_LQ_frame
+                    clean_vram()
 
             if hasattr(self.dit, "LQ_proj_in"):
                 self.dit.LQ_proj_in.clear_cache()
-
-            if unload_dit and hasattr(self, 'dit') and not next(self.dit.parameters()).is_cpu:
-                if enable_debug_logging:
-                    print("[FlashVSR] Offloading DiT to the CPU to free up VRAM...")
-                self.offload_model(keep_vae=True)
-
-            latents = torch.cat(latents_total, dim=2)
-
-            # Decode
-            if enable_debug_logging:
-                print("[FlashVSR] Starting VAE decoding...")
-
-            cur_LQ_frame = LQ_video.to(self.device)
-
-            if tiled: # tiled_vae logic ported from tiny-long
-                B, C, T, H, W = latents.shape
-
-                l_tile_h, l_tile_w = tile_size
-                l_stride_h, l_stride_w = tile_stride
-
-                if isinstance(l_tile_h, tuple): l_tile_h = l_tile_h[0]
-                if isinstance(l_tile_w, tuple): l_tile_w = l_tile_w[0]
-
-                l_tile_h = max(l_tile_h // 8, 4)
-                l_tile_w = max(l_tile_w // 8, 4)
-                l_stride_h = max(l_stride_h // 8, 1)
-                l_stride_w = max(l_stride_w // 8, 1)
-
-                out_H = H * 8
-                out_W = W * 8
-
-                cur_frames = torch.zeros((B, 3, T, out_H, out_W), dtype=latents.dtype, device='cpu')
-                weights = torch.zeros((B, 3, T, out_H, out_W), dtype=latents.dtype, device='cpu')
-
-                for y in range(0, H, l_stride_h):
-                    for x in range(0, W, l_stride_w):
-                        y_end = min(y + l_tile_h, H)
-                        x_end = min(x + l_tile_w, W)
-
-                        if y_end <= y or x_end <= x: continue
-
-                        lat_tile = latents[:, :, :, y:y_end, x:x_end]
-                        cond_y, cond_x = y * 8, x * 8
-                        cond_y_end, cond_x_end = y_end * 8, x_end * 8
-                        cond_tile = cur_LQ_frame[:, :, :LQ_cur_idx, cond_y:cond_y_end, cond_x:cond_x_end]
-
-                        out_tile = self.TCDecoder.decode_video(
-                            lat_tile.transpose(1, 2),
-                            parallel=False,
-                            show_progress_bar=False,
-                            cond=cond_tile
-                        )
-
-                        out_tile = out_tile.transpose(1, 2).to('cpu')
-                        th, tw = out_tile.shape[3], out_tile.shape[4]
-                        mask = torch.ones((1, 1, 1, th, tw), device='cpu')
-                        y_out, x_out = y * 8, x * 8
-                        cur_frames[:, :, :, y_out:y_out+th, x_out:x_out+tw] += out_tile * mask
-                        weights[:, :, :, y_out:y_out+th, x_out:x_out+tw] += mask
-
-                weights[weights == 0] = 1.0
-                cur_frames = cur_frames / weights
-                frames = cur_frames.mul_(2).sub_(1)
-            else:
-                frames = self.TCDecoder.decode_video(latents.transpose(1, 2),parallel=False, show_progress_bar=False, cond=cur_LQ_frame[:,:,:LQ_cur_idx,:,:]).transpose(1, 2).mul_(2).sub_(1)
 
             self.TCDecoder.clean_mem()
             if force_offload:
                 self.offload_model()
 
-            # 颜色校正（wavelet）
-            try:
-                if color_fix:
-                    frames = self.ColorCorrector(
-                        frames.to(device=LQ_video.device),
-                        LQ_video[:, :, :frames.shape[2], :, :],
-                        clip_range=(-1, 1),
-                        chunk_size=16,
-                        method='adain'
-                    )
-            except:
-                pass
+            frames = torch.cat(frames_total, dim=2)
 
         return frames[0]
 

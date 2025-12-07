@@ -51,22 +51,30 @@ def log(message: str, message_type: str = 'normal', icon: str = "", end: str = "
         message = message
 
     if in_place:
-        print(f"\r{message}", end="", flush=True)
+        # Clear line before printing
+        sys.stdout.write("\r\033[K" + message)
+        sys.stdout.flush()
     else:
         print(f"{message}", end=end, flush=True)
+
+def get_vram_info():
+    if torch.cuda.is_available():
+        vram_used = torch.cuda.memory_allocated() / (1024 ** 3)
+        vram_reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+        vram_total = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        return vram_used, vram_reserved, vram_total
+    return 0, 0, 0
 
 def log_resource_usage(prefix="Resource Usage", end="\n", in_place=False):
     ram = psutil.virtual_memory()
     ram_used = ram.used / (1024 ** 3)
     ram_total = ram.total / (1024 ** 3)
     
-    msg = f"[{prefix}] RAM: {ram_used:.2f}/{ram_total:.2f} GB"
+    msg = f"[{prefix}] RAM: {ram_used:.1f}/{ram_total:.1f}G"
     
     if torch.cuda.is_available():
-        vram_used = torch.cuda.memory_allocated() / (1024 ** 3)
-        vram_reserved = torch.cuda.max_memory_reserved() / (1024 ** 3)
-        vram_total = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-        msg += f" | VRAM: {vram_used:.2f}/{vram_reserved:.2f}/{vram_total:.2f} GB"
+        vram_used, vram_reserved, vram_total = get_vram_info()
+        msg += f" | VRAM: {vram_used:.1f}/{vram_reserved:.1f}/{vram_total:.1f}G"
         
     log(msg, message_type='info', icon="📊", end=end, in_place=in_place)
 
@@ -308,37 +316,35 @@ class cqdm:
             
             self.step_idx += 1
 
-            # Show a text progress bar in the log
+            # Show a text progress bar in the log (single line using \r)
             perc = (self.step_idx / self.total) * 100
-            bar_len = 30
+            bar_len = 20
             filled = int(bar_len * self.step_idx // self.total)
             bar = '█' * filled + '░' * (bar_len - filled)
 
-            # Format elapsed/remaining time
             elapsed = time.time() - self.start_time
             rate = self.step_idx / elapsed if elapsed > 0 else 0
-            remaining = (self.total - self.step_idx) / rate if rate > 0 else 0
 
-            msg = f"{self.desc}: {self.step_idx}/{self.total} |{bar}| {perc:.1f}% [{elapsed:.0f}s<{remaining:.0f}s, {rate:.1f}it/s]"
+            msg = f"{self.desc}: {self.step_idx}/{self.total} |{bar}| {perc:.1f}%"
 
             if self.enable_debug:
                 step_end = time.time()
                 step_time = step_end - step_start
-                # Detailed logging if debug is on (might span lines)
                 msg += f" (Step: {step_time:.2f}s)"
+                # Pass in_place=True to log_resource_usage to keep it on one line if possible
+                # But note log_resource_usage prints Resource usage which is long.
                 log_resource_usage(prefix=msg, in_place=True)
             else:
-                # Use logging to print progress to console in place
                 print(f"\r{msg}", end="", flush=True)
                 if self.step_idx == self.total:
-                    print() # Newline at end
+                    print()
 
             return val
         except StopIteration:
             total_time = time.time() - self.start_time
-            # Only print finish message if not already done by progress bar
             if self.enable_debug:
-                log(f"Loop '{self.desc}' finished in {total_time:.2f}s", message_type='finish', icon="✅")
+                # Use print with newline here to finalize the log block
+                print(f"\n✅ Loop '{self.desc}' finished in {total_time:.2f}s", flush=True)
             raise
             
     def __enter__(self):
@@ -389,18 +395,16 @@ def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_siz
             LQ_tile, th, tw, F = prepare_input_tensor(input_tile, _device, scale=scale, dtype=dtype)
             if not isinstance(pipe, FlashVSRTinyLongPipeline):
                 LQ_tile = LQ_tile.to(_device)
-                
-            try:
-                output_tile_gpu = pipe(
-                    prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=seed, tiled=tiled_vae,
-                    LQ_video=LQ_tile, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
-                    topk_ratio=sparse_ratio*768*1280/(th*tw), kv_ratio=kv_ratio, local_range=local_range,
-                    color_fix=color_fix, unload_dit=unload_dit, force_offload=force_offload,
-                    enable_debug_logging=enable_debug # Pass debug flag if supported by pipe
-                )
-            except torch.OutOfMemoryError as e:
-                log(f"OOM during Tiled Processing! Try reducing tile_size or enabling tiled_vae if not enabled.", message_type='error', icon="❌")
-                raise e
+
+            # Note: pipe() calls implicitly handle the rest.
+            # But pipe() can raise OOM. We let it propagate to flashvsr to handle fallback.
+            output_tile_gpu = pipe(
+                prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=seed, tiled=tiled_vae,
+                LQ_video=LQ_tile, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
+                topk_ratio=sparse_ratio*768*1280/(th*tw), kv_ratio=kv_ratio, local_range=local_range,
+                color_fix=color_fix, unload_dit=unload_dit, force_offload=force_offload,
+                enable_debug_logging=enable_debug
+            )
             
             processed_tile_cpu = tensor2video(output_tile_gpu).to("cpu")
             
@@ -444,17 +448,12 @@ def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_siz
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs, enable_debug=enable_debug)
 
-        try:
-            video = pipe(
-                prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=seed, tiled=tiled_vae,
-                progress_bar_cmd=cqdm_debug, LQ_video=LQ, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
-                topk_ratio=sparse_ratio*768*1280/(th*tw), kv_ratio=kv_ratio, local_range=local_range,
-                color_fix = color_fix, unload_dit=unload_dit, force_offload=force_offload
-            )
-        except torch.OutOfMemoryError as e:
-            log(f"OOM during Processing! Try reducing frame_chunk_size (current: {frames.shape[0]}) or enabling tiled_vae / tiled_dit.", message_type='error', icon="❌")
-            clean_vram()
-            raise e
+        video = pipe(
+            prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=seed, tiled=tiled_vae,
+            progress_bar_cmd=cqdm_debug, LQ_video=LQ, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
+            topk_ratio=sparse_ratio*768*1280/(th*tw), kv_ratio=kv_ratio, local_range=local_range,
+            color_fix = color_fix, unload_dit=unload_dit, force_offload=force_offload
+        )
 
         process_end = time.time()
         
@@ -467,11 +466,12 @@ def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_siz
         clean_vram()
 
     if is_single_frame_input and frames.shape[0] == 1:
-        final_output = final_output.to("cpu")
-        stacked_image_tensor = torch.median(final_output, dim=0).values.unsqueeze(0).float()
-        del final_output
-        clean_vram()
-        return stacked_image_tensor
+        if frames.shape[0] == 1:
+            final_output = final_output.to("cpu")
+            stacked_image_tensor = torch.median(final_output, dim=0).values.unsqueeze(0).float()
+            del final_output
+            clean_vram()
+            return stacked_image_tensor
 
     return final_output[:frames.shape[0], :, :, :]
 
@@ -494,6 +494,13 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
         log(f"Tiled DiT: {tiled_dit}, Tiled VAE: {tiled_vae}", message_type='info', icon="🧩")
         log_resource_usage(prefix="Start")
 
+    # VRAM check and warning
+    if torch.cuda.is_available():
+        vram_used = torch.cuda.memory_allocated()
+        vram_total = torch.cuda.get_device_properties(0).total_memory
+        if vram_used / vram_total > 0.95:
+            log("Warning: VRAM usage is very high (>95%)! Enabling fallback options is recommended.", message_type='warning', icon="⚠️")
+
     # Chunking Logic
     total_frames = frames.shape[0]
     final_outputs = []
@@ -503,7 +510,7 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
     if chunk_size > 0 and chunk_size < total_frames:
         num_chunks = math.ceil(total_frames / chunk_size)
         log(f"Splitting video into {num_chunks} chunks (size {chunk_size})...", message_type='info', icon="✂️")
-        
+
         for i in range(num_chunks):
             chunk_start = i * chunk_size
             chunk_end = min((i + 1) * chunk_size, total_frames)
@@ -513,25 +520,70 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
 
             chunk_frames = frames[chunk_start:chunk_end]
 
-            chunk_out = process_chunk(
-                pipe, chunk_frames, scale, color_fix, tiled_vae, tiled_dit,
-                tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio,
-                local_range, seed, force_offload, enable_debug,
-                is_single_frame_input=is_single_frame_input
-            )
+            # Auto-Fallback Logic
+            retry_count = 0
+            max_retries = 2
+            current_tiled_vae = tiled_vae
+            current_tiled_dit = tiled_dit
 
-            final_outputs.append(chunk_out.cpu())
-            del chunk_out
-            clean_vram()
+            while retry_count <= max_retries:
+                try:
+                    chunk_out = process_chunk(
+                        pipe, chunk_frames, scale, color_fix, current_tiled_vae, current_tiled_dit,
+                        tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio,
+                        local_range, seed, force_offload, enable_debug,
+                        is_single_frame_input=is_single_frame_input
+                    )
+                    final_outputs.append(chunk_out.cpu())
+                    del chunk_out
+                    clean_vram()
+                    break # Success
+                except torch.OutOfMemoryError as e:
+                    retry_count += 1
+                    clean_vram()
+                    log(f"OOM detected in Chunk {i+1} (Attempt {retry_count}). Recovering...", message_type='warning', icon="🔄")
+
+                    if not current_tiled_vae:
+                        log("Enabling Tiled VAE fallback...", message_type='info', icon="🛡️")
+                        current_tiled_vae = True
+                    elif not current_tiled_dit:
+                        log("Enabling Tiled DiT fallback...", message_type='info', icon="🛡️")
+                        current_tiled_dit = True
+                    else:
+                        log("Both Tiled VAE and DiT enabled but still OOM. Cannot recover.", message_type='error', icon="❌")
+                        raise e # Cannot recover further
 
         final_output_tensor = torch.cat(final_outputs, dim=0)
     else:
-        final_output_tensor = process_chunk(
-            pipe, frames, scale, color_fix, tiled_vae, tiled_dit,
-            tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio,
-            local_range, seed, force_offload, enable_debug,
-            is_single_frame_input=is_single_frame_input
-        )
+        # Auto-Fallback Logic for single chunk/full video
+        retry_count = 0
+        max_retries = 2
+        current_tiled_vae = tiled_vae
+        current_tiled_dit = tiled_dit
+
+        while retry_count <= max_retries:
+            try:
+                final_output_tensor = process_chunk(
+                    pipe, frames, scale, color_fix, current_tiled_vae, current_tiled_dit,
+                    tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio,
+                    local_range, seed, force_offload, enable_debug,
+                    is_single_frame_input=is_single_frame_input
+                )
+                break
+            except torch.OutOfMemoryError as e:
+                retry_count += 1
+                clean_vram()
+                log(f"OOM detected (Attempt {retry_count}). Recovering...", message_type='warning', icon="🔄")
+
+                if not current_tiled_vae:
+                    log("Enabling Tiled VAE fallback...", message_type='info', icon="🛡️")
+                    current_tiled_vae = True
+                elif not current_tiled_dit:
+                    log("Enabling Tiled DiT fallback...", message_type='info', icon="🛡️")
+                    current_tiled_dit = True
+                else:
+                    log("Both Tiled VAE and DiT enabled but still OOM. Cannot recover.", message_type='error', icon="❌")
+                    raise e
 
     end_time = time.time()
     total_time = end_time - start_time

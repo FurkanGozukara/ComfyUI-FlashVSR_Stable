@@ -167,10 +167,10 @@ class FlashVSRTinyLongPipeline(BasePipeline):
 
         print(r"""
  ███████╗██╗      █████╗ ███████╗██╗  ██╗██╗   ██╗███████╗█████╗
- ██╔════╝██║     ██╔══██╗██╔════╝██║  ██║██║   ██║██╔════╝██╔══██╗   ██╗     ██╗
- █████╗  ██║     ███████║███████╗███████║╚██╗ ██╔╝███████╗███████║ ██████╗ ██████╗
- ██╔══╝  ██║     ██╔══██║╚════██║██╔══██║ ╚████╔╝ ╚════██║██╔═██║    ██╔═╝   ██╔═╝
- ██║     ███████╗██║  ██║███████║██║  ██║  ╚██╔╝  ███████║██║  ██║   ╚═╝     ╚═╝
+ ██╔════╝██║     ██╔══██╗██╔════╝██║  ██║██║   ██║██╔════╝██╔══██╗   ██╗
+ █████╗  ██║     ███████║███████╗███████║╚██╗ ██╔╝███████╗███████║ ██████╗
+ ██╔══╝  ██║     ██╔══██║╚════██║██╔══██║ ╚████╔╝ ╚════██║██╔═██║    ██╔═╝ 
+ ██║     ███████╗██║  ██║███████║██║  ██║  ╚██╔╝  ███████║██║  ██║   ╚═╝
  ╚═╝     ╚══════╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝   ╚═╝   ╚══════╝╚═╝  ╚═╝
 """)
 
@@ -348,7 +348,9 @@ class FlashVSRTinyLongPipeline(BasePipeline):
             num_frames = (num_frames + 2) // 4 * 4 + 1
             print(f"Only `num_frames % 4 != 1` is acceptable. We round it up to {num_frames}.")
 
-        # Tiler 参数
+        # Tiler 参数 - Use arguments or defaults if not provided in kwargs
+        # Note: __call__ signature has defaults for tile_size/stride which might be inappropriate if they are latent-space defaults but node passes pixel-space.
+        # But here tile_size/stride are arguments.
         tiler_kwargs = {"tiled": tiled, "tile_size": tile_size, "tile_stride": tile_stride}
 
         # 初始化噪声
@@ -377,6 +379,9 @@ class FlashVSRTinyLongPipeline(BasePipeline):
         LQ_cur_idx = 0
         self.TCDecoder.clean_mem()
 
+        # Initialize tile states for VAE if needed
+        vae_tile_states = {} 
+        
         with torch.no_grad():
             for cur_process_idx in progress_bar_cmd(range(process_total_num)):
                 if cur_process_idx == 0:
@@ -440,11 +445,84 @@ class FlashVSRTinyLongPipeline(BasePipeline):
                 
                 # Decode
                 cur_LQ_frame = LQ_video[:,:,LQ_pre_idx:LQ_cur_idx,:,:].to(self.device)
-                cur_frames = self.TCDecoder.decode_video(
-                    cur_latents.transpose(1, 2),
-                    parallel=False,
-                    show_progress_bar=False,
-                    cond=cur_LQ_frame).transpose(1, 2).mul_(2).sub_(1)
+                
+                if tiled: # tiled_vae
+                    B, C, T, H, W = cur_latents.shape
+                    
+                    l_tile_h, l_tile_w = tile_size
+                    l_stride_h, l_stride_w = tile_stride
+                    
+                    # Convert pixel-space tile sizes to latent space
+                    # The inputs from the node are typically in pixel space (e.g. 256).
+                    # Latents are H/8.
+                    
+                    # Ensure we are working with ints
+                    if isinstance(l_tile_h, tuple): l_tile_h = l_tile_h[0] # Fallback if tuple passed
+                    if isinstance(l_tile_w, tuple): l_tile_w = l_tile_w[0]
+                    
+                    l_tile_h = max(l_tile_h // 8, 4)
+                    l_tile_w = max(l_tile_w // 8, 4)
+                    l_stride_h = max(l_stride_h // 8, 1)
+                    l_stride_w = max(l_stride_w // 8, 1)
+                    
+                    out_H = H * 8
+                    out_W = W * 8
+                    
+                    # Accumulation buffers on CPU to prevent VRAM spikes
+                    cur_frames = torch.zeros((B, 3, T, out_H, out_W), dtype=cur_latents.dtype, device='cpu')
+                    weights = torch.zeros((B, 3, T, out_H, out_W), dtype=cur_latents.dtype, device='cpu')
+                    
+                    for y in range(0, H, l_stride_h):
+                        for x in range(0, W, l_stride_w):
+                            y_end = min(y + l_tile_h, H)
+                            x_end = min(x + l_tile_w, W)
+                            
+                            if y_end <= y or x_end <= x: continue
+                            
+                            # Latent tile
+                            lat_tile = cur_latents[:, :, :, y:y_end, x:x_end]
+                            
+                            # Cond tile
+                            cond_y, cond_x = y * 8, x * 8
+                            cond_y_end, cond_x_end = y_end * 8, x_end * 8
+                            cond_tile = cur_LQ_frame[:, :, :, cond_y:cond_y_end, cond_x:cond_x_end]
+                            
+                            # State management
+                            tile_key = (y, x)
+                            if tile_key not in vae_tile_states:
+                                vae_tile_states[tile_key] = [None] * len(self.TCDecoder.decoder)
+                            mem_tile = vae_tile_states[tile_key]
+                            
+                            # Decode
+                            out_tile, new_mem_tile = self.TCDecoder.decode_video(
+                                lat_tile.transpose(1, 2),
+                                parallel=False,
+                                show_progress_bar=False,
+                                cond=cond_tile,
+                                mem=mem_tile
+                            )
+                            vae_tile_states[tile_key] = new_mem_tile
+                            
+                            # Accumulate
+                            out_tile = out_tile.transpose(1, 2).to('cpu')
+                            th, tw = out_tile.shape[3], out_tile.shape[4]
+                            
+                            mask = torch.ones((1, 1, 1, th, tw), device='cpu')
+                            
+                            y_out, x_out = y * 8, x * 8
+                            cur_frames[:, :, :, y_out:y_out+th, x_out:x_out+tw] += out_tile * mask
+                            weights[:, :, :, y_out:y_out+th, x_out:x_out+tw] += mask
+                            
+                    weights[weights == 0] = 1.0
+                    cur_frames = cur_frames / weights
+                    cur_frames = cur_frames.mul_(2).sub_(1)
+                    
+                else:
+                    cur_frames = self.TCDecoder.decode_video(
+                        cur_latents.transpose(1, 2),
+                        parallel=False,
+                        show_progress_bar=False,
+                        cond=cur_LQ_frame).transpose(1, 2).mul_(2).sub_(1)
 
                 # 颜色校正（wavelet）
                 try:

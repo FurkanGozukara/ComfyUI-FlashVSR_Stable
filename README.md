@@ -107,13 +107,13 @@ If VRAM is insufficient:
 
 All VAE models auto-download from HuggingFace if not found locally:
 
-| File | Source URL |
-| :--- | :--- |
-| `Wan2.1_VAE.pth` | `huggingface.co/lightx2v/Autoencoders` |
-| `Wan2.2_VAE.pth` | `huggingface.co/lightx2v/Autoencoders` |
-| `lightvaew2_1.pth` | `huggingface.co/lightx2v/Autoencoders` |
-| `taew2_2.safetensors` | `huggingface.co/lightx2v/Autoencoders` |
-| `lighttaehy1_5.pth` | `huggingface.co/lightx2v/Autoencoders` |
+| VAE Selection | File | Direct Download Link |
+| :--- | :--- | :--- |
+| **Wan2.1** | `Wan2.1_VAE.pth` | [Download](https://huggingface.co/lightx2v/Autoencoders/blob/main/Wan2.1_VAE.pth) |
+| **Wan2.2** | `Wan2.2_VAE.pth` | [Download](https://huggingface.co/lightx2v/Autoencoders/blob/main/Wan2.2_VAE.pth) |
+| **LightVAE_W2.1** | `lightvaew2_1.pth` | [Download](https://huggingface.co/lightx2v/Autoencoders/blob/main/lightvaew2_1.pth) |
+| **TAE_W2.2** | `taew2_2.safetensors` | [Download](https://huggingface.co/lightx2v/Autoencoders/blob/main/taew2_2.safetensors) |
+| **LightTAE_HY1.5** | `lighttaehy1_5.pth` | [Download](https://huggingface.co/lightx2v/Autoencoders/blob/main/lighttaehy1_5.pth) |
 
 ---
 

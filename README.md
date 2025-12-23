@@ -204,7 +204,7 @@ git clone https://github.com/naxci1/ComfyUI-FlashVSR_Stable.git
 python -m pip install -r ComfyUI-FlashVSR_Stable/requirements.txt
 ```
 
-> 📢 **Turing or older GPUs**: Install `triton<3.3.0`:
+> 📢 **Turing architecture or older GPUs (GTX 16 series, RTX 20 series, and earlier)**: Install `triton<3.3.0`:
 > ```bash
 > # Windows
 > python -m pip install -U triton-windows<3.3.0

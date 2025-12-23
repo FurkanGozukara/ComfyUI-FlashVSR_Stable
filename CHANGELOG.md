@@ -23,13 +23,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 #### 5 VAE Model Options (FIX 1 & 7)
 - **Unified `vae_model` Dropdown**: Single input replacing redundant `vae_type` and `alt_vae` fields.
 - **Five VAE Options**:
-  | Selection | File | Architecture | Use Case |
-  |-----------|------|--------------|----------|
-  | Wan2.1 | Wan2.1_VAE.pth | WanVideoVAE | Original baseline, maximum compatibility |
-  | Wan2.2 | Wan2.2_VAE.pth | Wan22VideoVAE | Updated normalization for Wan2.2 regime |
-  | LightVAE_W2.1 | lightvaew2_1.pth | LightX2VVAE | ~50% VRAM reduction, 2-3x faster |
-  | TAE_W2.2 | taew2_2.safetensors | TAEW22VAE | Temporal autoencoder for Wan2.2 |
-  | LightTAE_HY1.5 | lighttaehy1_5.pth | LightTAEHY15VAE | HunyuanVideo compatible |
+
+| Selection | File | Architecture | Use Case |
+|-----------|------|--------------|----------|
+| Wan2.1 | Wan2.1_VAE.pth | WanVideoVAE | Original baseline, maximum compatibility |
+| Wan2.2 | Wan2.2_VAE.pth | Wan22VideoVAE | Updated normalization for Wan2.2 regime |
+| LightVAE_W2.1 | lightvaew2_1.pth | LightX2VVAE | ~50% VRAM reduction, 2-3x faster |
+| TAE_W2.2 | taew2_2.safetensors | TAEW22VAE | Temporal autoencoder for Wan2.2 |
+| LightTAE_HY1.5 | lighttaehy1_5.pth | LightTAEHY15VAE | HunyuanVideo compatible |
 
 #### Auto-Download System (FIX 6)
 - **Automatic Model Downloads**: VAE files auto-download from HuggingFace if missing.

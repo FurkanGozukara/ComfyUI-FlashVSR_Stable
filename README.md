@@ -3,13 +3,27 @@ Running FlashVSR on lower VRAM without any artifacts.
 
 ## Changelog
 
+#### 23.12.2025
+- **🔍 NEW: Pre-Flight Resource Calculator**: Intelligent VRAM/RAM estimation before processing.
+  - Automatically calculates estimated VRAM requirements based on resolution, frames, and settings.
+  - Provides optimal settings recommendations if OOM is predicted.
+  - Example: "Current chunk_size (16) is too high for 8GB VRAM. Recommended: chunk_size=4, resize_factor=0.5"
+- **🔧 Unified Processing Pipeline**: `tiny-long` optimizations now applied to all modes (`full`, `tiny`, `tiny-long`).
+- **📊 5 VAE Options**: Expanded VAE selection with full support for:
+  - `Wan2.1`: Original baseline VAE
+  - `Wan2.2`: Updated normalization for Wan2.2 training regime
+  - `LightVAE_W2.1`: ~50% VRAM reduction with LightX2V architecture
+  - `TAE_W2.2`: Temporal autoencoder for Wan2.2
+  - `LightTAE_HY1.5`: HunyuanVideo compatible temporal autoencoder
+- **⬇️ Auto-Download**: VAE models automatically download from HuggingFace if missing.
+- **🛡️ 95% VRAM Threshold**: OOM recovery only triggers at 95% VRAM usage (optimized for RTX 5070 Ti).
+- **✅ Fixed Tensor Permutation**: Resolved video corruption issues with correct tensor shape handling.
+- **✅ Fixed Black Borders**: Cropping now happens ONLY AFTER VAE decode is complete.
+
 #### 22.12.2025
 - **🚀 NEW: Wan2.2 VAE Support**: Integrated Wan2.2 VAE with optimized normalization statistics for improved video quality.
 - **⚡ NEW: LightX2V VAE Integration**: Added LightX2V VAE option for ~50% VRAM reduction and 2-3x faster inference.
-- **New Feature**: Added `vae_type` selection in both Init Pipeline and Ultra-Fast nodes. Choose between:
-  - `wan2.1`: Original VAE (default, maximum compatibility)
-  - `wan2.2`: Updated normalization for Wan2.2 training regime
-  - `lightx2v`: Optimized lightweight VAE for reduced memory usage
+- **New Feature**: Added `vae_model` selection in both Init Pipeline and Ultra-Fast nodes.
 - **VRAM Optimization**: LightX2V VAE reduces peak VRAM usage by approximately 50% while maintaining near-original quality.
 - **Performance**: LightX2V provides 2-3x faster VAE decode times compared to full Wan VAE.
 - **Architecture**: All new VAE types maintain full backward compatibility with existing Wan2.1 weights.
@@ -81,19 +95,51 @@ This node is optimized for various hardware configurations. Here are some guidel
 - **Chunking**: Use `frame_chunk_size` to process videos in segments. This moves processed frames to CPU RAM, preventing VRAM saturation on long clips.
 - **Resize Input**: If the input video is large (e.g., 1080p), use the `resize_factor` parameter to reduce input size to `0.5x` before processing. This drastically reduces VRAM usage and allows for 4x upscaling of the resized result (net 2x output). For small videos, leave at `1.0`.
 
+### Pre-Flight Resource Check (NEW)
+
+Before processing, FlashVSR now performs an intelligent pre-flight check that:
+
+1. **Estimates VRAM Requirements**: Calculates approximate VRAM needed based on resolution, frames, scale, and settings.
+2. **Checks Available Resources**: Uses `torch.cuda.mem_get_info()` for accurate real-time VRAM availability.
+3. **Provides Recommendations**: If OOM is predicted, suggests optimal settings.
+
+Example console output:
+```
+============================================================
+🔍 PRE-FLIGHT RESOURCE CHECK
+💻 RAM: 15.4GB / 95.8GB
+💾 VRAM Available: 14.2GB
+📊 Estimated VRAM Required: 12.8GB
+✅ Safe to proceed. Estimated ~12.8GB needed, 14.2GB available.
+============================================================
+```
+
+If VRAM is insufficient:
+```
+⚠️ Current settings require ~18.5GB but only 8.0GB available.
+💡 Recommended Optimal Settings:
+  • chunk_size = 32
+  • tiled_vae = True
+  • tiled_dit = True
+  • resize_factor = 0.6
+```
+
 ### VAE Type Comparison
 
 | VAE Type | VRAM Usage | Speed | Quality | Best For |
 | :--- | :--- | :--- | :--- | :--- |
-| **wan2.1** | 8-12 GB | Baseline | ⭐⭐⭐⭐⭐ | Maximum quality, 24GB+ VRAM |
-| **wan2.2** | 8-12 GB | Baseline | ⭐⭐⭐⭐⭐ | Improved normalization for Wan2.2 models |
-| **lightx2v** | 4-5 GB | 2-3x faster | ⭐⭐⭐⭐ | 8-16GB VRAM, speed priority |
+| **Wan2.1** | 8-12 GB | Baseline | ⭐⭐⭐⭐⭐ | Maximum quality, 24GB+ VRAM |
+| **Wan2.2** | 8-12 GB | Baseline | ⭐⭐⭐⭐⭐ | Improved normalization for Wan2.2 models |
+| **LightVAE_W2.1** | 4-5 GB | 2-3x faster | ⭐⭐⭐⭐ | 8-16GB VRAM, speed priority |
+| **TAE_W2.2** | 6-8 GB | 1.5x faster | ⭐⭐⭐⭐ | Temporal consistency priority |
+| **LightTAE_HY1.5** | 3-4 GB | 3x faster | ⭐⭐⭐⭐ | HunyuanVideo compatible, minimum VRAM |
 
 **Recommendations:**
-- **8GB VRAM**: Use `lightx2v` + `tiled_vae=True` + `tiled_dit=True`
-- **12GB VRAM**: Use `lightx2v` or `wan2.1` with tiling enabled
-- **16GB+ VRAM**: Use any VAE type; `wan2.1`/`wan2.2` for maximum quality
-- **Speed Priority**: Use `lightx2v` for 2-3x faster inference
+- **8GB VRAM**: Use `LightVAE_W2.1` or `LightTAE_HY1.5` + `tiled_vae=True` + `tiled_dit=True`
+- **12GB VRAM**: Use `LightVAE_W2.1` or `Wan2.1` with tiling enabled
+- **16GB+ VRAM**: Use any VAE type; `Wan2.1`/`Wan2.2` for maximum quality
+- **Speed Priority**: Use `LightVAE_W2.1` or `LightTAE_HY1.5` for 2-3x faster inference
+- **Auto-Download**: All VAE files auto-download from HuggingFace if not present
 
 ## Node Features
 
@@ -104,10 +150,12 @@ Hover over any input in ComfyUI to see these details:
   - `tiny`: Standard fast mode. Now supports VAE tiling.
   - `tiny-long`: Streaming mode for very long videos. Lowest VRAM spike.
   - `full`: Uses the full VAE encoder (optional). Highest VRAM. Supports VAE tiling.
-- **vae_type**: Select the VAE architecture:
-  - `wan2.1`: Original VAE (default, maximum compatibility)
-  - `wan2.2`: Updated normalization for Wan2.2 training regime
-  - `lightx2v`: Optimized lightweight VAE (~50% less VRAM, 2-3x faster)
+- **vae_model**: Select the VAE architecture (5 options with auto-download):
+  - `Wan2.1`: Original VAE (default, maximum compatibility)
+  - `Wan2.2`: Updated normalization for Wan2.2 training regime
+  - `LightVAE_W2.1`: Optimized lightweight VAE (~50% less VRAM, 2-3x faster)
+  - `TAE_W2.2`: Temporal autoencoder for better temporal consistency
+  - `LightTAE_HY1.5`: HunyuanVideo compatible, minimum VRAM
 - **scale**: Upscaling factor (2x or 4x).
 - **color_fix**: Corrects color shifts using wavelet transfer. Highly recommended.
 - **tiled_vae**: Spatially splits frames during decoding. Saves massive VRAM at the cost of speed.

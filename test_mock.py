@@ -22,6 +22,7 @@ if not torch.cuda.is_available():
     torch.cuda.is_available = MagicMock(return_value=False)
 
 from nodes import flashvsr, FlashVSRNodeInitPipe, FlashVSRNode, FlashVSRNodeAdv, VAE_MODEL_OPTIONS, VAE_MODEL_MAP
+from nodes import estimate_vram_usage, get_optimal_settings, check_resources
 from src.pipelines.flashvsr_full import FlashVSRFullPipeline
 from src.models.wan_video_vae import WanVideoVAE, Wan22VideoVAE, LightX2VVAE, create_video_vae
 
@@ -84,6 +85,57 @@ class TestFlashVSRNodes(unittest.TestCase):
         node_types = FlashVSRNode.INPUT_TYPES()
         self.assertIn('vae_model', node_types['required'])
         self.assertNotIn('vae_type', node_types['required'])
+
+    # ==========================================================================
+    # FIX 9: Tests for Pre-Flight Resource Calculator
+    # ==========================================================================
+    def test_estimate_vram_usage_modes(self):
+        """Test estimate_vram_usage returns different values for different modes."""
+        vram_full = estimate_vram_usage(1280, 720, 100, 2, mode='full')
+        vram_tiny = estimate_vram_usage(1280, 720, 100, 2, mode='tiny')
+        vram_tiny_long = estimate_vram_usage(1280, 720, 100, 2, mode='tiny-long')
+        
+        # All should return positive values
+        self.assertGreater(vram_full, 0)
+        self.assertGreater(vram_tiny, 0)
+        self.assertGreater(vram_tiny_long, 0)
+        
+        # Full mode should use most VRAM
+        self.assertGreater(vram_full, vram_tiny_long)
+    
+    def test_estimate_vram_usage_tiling_reduces(self):
+        """Test that tiling reduces estimated VRAM."""
+        vram_no_tile = estimate_vram_usage(1280, 720, 100, 2, tiled_vae=False, tiled_dit=False)
+        vram_tiled = estimate_vram_usage(1280, 720, 100, 2, tiled_vae=True, tiled_dit=True)
+        
+        self.assertLess(vram_tiled, vram_no_tile)
+    
+    def test_estimate_vram_usage_chunking_reduces(self):
+        """Test that chunking reduces estimated VRAM."""
+        vram_no_chunk = estimate_vram_usage(1280, 720, 100, 2, chunk_size=0)
+        vram_chunked = estimate_vram_usage(1280, 720, 100, 2, chunk_size=25)
+        
+        self.assertLess(vram_chunked, vram_no_chunk)
+    
+    def test_get_optimal_settings_high_vram(self):
+        """Test that high VRAM returns default settings."""
+        settings = get_optimal_settings(640, 480, 50, 2, available_vram_gb=32.0, mode='full')
+        
+        # With 32GB VRAM, should be safe with defaults
+        self.assertFalse(settings['tiled_vae'])
+        self.assertFalse(settings['tiled_dit'])
+        self.assertEqual(settings['chunk_size'], 0)
+        self.assertEqual(settings['resize_factor'], 1.0)
+    
+    def test_get_optimal_settings_low_vram(self):
+        """Test that low VRAM suggests tiling and chunking."""
+        settings = get_optimal_settings(1920, 1080, 200, 4, available_vram_gb=4.0, mode='full')
+        
+        # With only 4GB for 4K upscale, should recommend aggressive settings
+        self.assertTrue(settings['tiled_vae'])
+        self.assertTrue(settings['tiled_dit'])
+        # Should recommend some chunking or resize
+        self.assertTrue(settings['chunk_size'] > 0 or settings['resize_factor'] < 1.0)
 
     def test_vae_factory_function(self):
         """Test the create_video_vae factory function."""

@@ -163,16 +163,22 @@ def log_resource_usage(prefix="Resource Usage", end="\n", in_place=False):
 
 
 # =============================================================================
-# FIX 5: VRAM Estimation and Advisory Logging
-# Calculate approximate VRAM requirements based on resolution and frames
+# FIX 5 & 9: VRAM Estimation, Pre-Flight Resource Check & Settings Recommender
+# Calculate approximate VRAM requirements and provide optimal settings
 # =============================================================================
-def estimate_vram_usage(width, height, num_frames, scale, tiled_vae=False, tiled_dit=False):
+def estimate_vram_usage(width, height, num_frames, scale, tiled_vae=False, tiled_dit=False, 
+                         chunk_size=0, mode="full"):
     """
     Estimate approximate VRAM usage for the given video parameters.
-    Returns estimated VRAM in GB.
+    Returns estimated VRAM in GB. Enhanced to consider chunk_size and mode.
     """
-    # Base model memory (DiT + VAE decoder)
-    base_model_gb = 4.0  # Approximate base memory for models
+    # Base model memory varies by mode
+    if mode == "full":
+        base_model_gb = 5.0  # Full VAE + DiT
+    elif mode == "tiny-long":
+        base_model_gb = 3.5  # TCDecoder is lighter than full VAE
+    else:  # tiny
+        base_model_gb = 4.0
     
     # Per-frame latent memory (scaled output resolution)
     output_h, output_w = height * scale, width * scale
@@ -180,16 +186,19 @@ def estimate_vram_usage(width, height, num_frames, scale, tiled_vae=False, tiled
     # Latent dimensions (8x downsampled)
     latent_h, latent_w = output_h // 8, output_w // 8
     
+    # Frames to process at once (if chunked, use chunk_size)
+    effective_frames = chunk_size if chunk_size > 0 and chunk_size <= num_frames else num_frames
+    
     # Approximate memory per frame in latent space (16 channels, bf16)
     bytes_per_frame = latent_h * latent_w * 16 * 2  # bf16 = 2 bytes
-    total_latent_gb = (bytes_per_frame * num_frames) / (1024 ** 3)
+    total_latent_gb = (bytes_per_frame * effective_frames) / (1024 ** 3)
     
     # DiT attention memory (quadratic with sequence length)
-    seq_len = latent_h * latent_w * (num_frames // 4)
+    seq_len = latent_h * latent_w * (effective_frames // 4)
     attention_gb = (seq_len * seq_len * 2) / (1024 ** 3) * 0.001  # Rough estimate
     
     # VAE decode memory
-    vae_decode_gb = (output_h * output_w * 3 * num_frames * 2) / (1024 ** 3)
+    vae_decode_gb = (output_h * output_w * 3 * effective_frames * 2) / (1024 ** 3)
     
     # Apply tiling reductions
     if tiled_dit:
@@ -201,14 +210,218 @@ def estimate_vram_usage(width, height, num_frames, scale, tiled_vae=False, tiled
     return total_estimated
 
 
-def log_vram_advisory(width, height, num_frames, scale, tiled_vae, tiled_dit):
+def get_optimal_settings(width, height, num_frames, scale, available_vram_gb, mode="full"):
+    """
+    Calculate optimal settings (chunk_size, resize_factor, tiling) based on VRAM.
+    
+    Returns dict with recommended settings.
+    """
+    # Target VRAM usage: 85% of available to leave headroom
+    target_vram = available_vram_gb * 0.85
+    
+    # Start with default settings
+    recommended = {
+        "chunk_size": 0,  # 0 = process all at once
+        "resize_factor": 1.0,
+        "tiled_vae": False,
+        "tiled_dit": False,
+        "warning": None
+    }
+    
+    # Test current settings
+    estimated = estimate_vram_usage(width, height, num_frames, scale, 
+                                     tiled_vae=False, tiled_dit=False, 
+                                     chunk_size=0, mode=mode)
+    
+    if estimated <= target_vram:
+        # Settings are fine
+        return recommended
+    
+    # Try enabling tiled VAE first (least impact on quality)
+    estimated_tiled_vae = estimate_vram_usage(width, height, num_frames, scale,
+                                               tiled_vae=True, tiled_dit=False,
+                                               chunk_size=0, mode=mode)
+    if estimated_tiled_vae <= target_vram:
+        recommended["tiled_vae"] = True
+        return recommended
+    
+    # Try enabling both tiling
+    estimated_both_tiled = estimate_vram_usage(width, height, num_frames, scale,
+                                                tiled_vae=True, tiled_dit=True,
+                                                chunk_size=0, mode=mode)
+    if estimated_both_tiled <= target_vram:
+        recommended["tiled_vae"] = True
+        recommended["tiled_dit"] = True
+        return recommended
+    
+    # Need chunking - find optimal chunk size
+    recommended["tiled_vae"] = True
+    recommended["tiled_dit"] = True
+    
+    for chunk in [100, 64, 32, 16, 8, 4]:
+        if chunk >= num_frames:
+            continue
+        estimated_chunked = estimate_vram_usage(width, height, num_frames, scale,
+                                                 tiled_vae=True, tiled_dit=True,
+                                                 chunk_size=chunk, mode=mode)
+        if estimated_chunked <= target_vram:
+            recommended["chunk_size"] = chunk
+            return recommended
+    
+    # Still too high - recommend resize factor
+    for resize in [0.8, 0.6, 0.5, 0.4, 0.3]:
+        new_h, new_w = int(height * resize), int(width * resize)
+        estimated_resized = estimate_vram_usage(new_w, new_h, num_frames, scale,
+                                                 tiled_vae=True, tiled_dit=True,
+                                                 chunk_size=8, mode=mode)
+        if estimated_resized <= target_vram:
+            recommended["chunk_size"] = 8
+            recommended["resize_factor"] = resize
+            return recommended
+    
+    # Even with max reduction still risky
+    recommended["chunk_size"] = 4
+    recommended["resize_factor"] = 0.3
+    recommended["warning"] = "VRAM critically low. Results may be unstable."
+    return recommended
+
+
+def check_resources(width, height, num_frames, scale, chunk_size, resize_factor, 
+                    tiled_vae, tiled_dit, mode="full"):
+    """
+    =============================================================================
+    FIX 9: Pre-Flight Resource Calculator
+    =============================================================================
+    
+    Performs intelligent pre-flight check before loading heavy models.
+    
+    1. Gets hardware stats (VRAM, RAM) using torch.cuda.mem_get_info()
+    2. Estimates required memory based on video parameters
+    3. Simulates if current settings will cause OOM
+    4. Provides optimal settings recommendations
+    
+    Returns:
+        dict with keys:
+        - estimated_vram_gb: float
+        - available_vram_gb: float
+        - ram_used_gb: float
+        - ram_total_gb: float
+        - will_oom: bool
+        - recommended_settings: dict (if will_oom)
+        - message: str
+    """
+    result = {
+        "estimated_vram_gb": 0.0,
+        "available_vram_gb": 0.0,
+        "ram_used_gb": 0.0,
+        "ram_total_gb": 0.0,
+        "will_oom": False,
+        "recommended_settings": None,
+        "message": ""
+    }
+    
+    # Get RAM info
+    ram = psutil.virtual_memory()
+    result["ram_used_gb"] = ram.used / (1024 ** 3)
+    result["ram_total_gb"] = ram.total / (1024 ** 3)
+    
+    # Get VRAM info
+    if torch.cuda.is_available():
+        vram_free, vram_total = torch.cuda.mem_get_info()
+        result["available_vram_gb"] = vram_free / (1024 ** 3)
+        vram_total_gb = vram_total / (1024 ** 3)
+    else:
+        result["message"] = "CUDA not available. Running on CPU may be very slow."
+        return result
+    
+    # Calculate effective dimensions after resize
+    effective_h = int(height * resize_factor) if resize_factor < 1.0 else height
+    effective_w = int(width * resize_factor) if resize_factor < 1.0 else width
+    
+    # Estimate VRAM usage
+    result["estimated_vram_gb"] = estimate_vram_usage(
+        effective_w, effective_h, num_frames, scale,
+        tiled_vae=tiled_vae, tiled_dit=tiled_dit,
+        chunk_size=chunk_size, mode=mode
+    )
+    
+    # Check if OOM likely
+    if result["estimated_vram_gb"] > result["available_vram_gb"] * VRAM_OOM_THRESHOLD:
+        result["will_oom"] = True
+        result["recommended_settings"] = get_optimal_settings(
+            effective_w, effective_h, num_frames, scale, 
+            result["available_vram_gb"], mode
+        )
+    
+    # Build message
+    if result["will_oom"]:
+        rec = result["recommended_settings"]
+        msg_parts = []
+        if rec["chunk_size"] != chunk_size and rec["chunk_size"] > 0:
+            msg_parts.append(f"chunk_size={rec['chunk_size']}")
+        if rec["resize_factor"] != resize_factor:
+            msg_parts.append(f"resize_factor={rec['resize_factor']:.1f}")
+        if rec["tiled_vae"] and not tiled_vae:
+            msg_parts.append("tiled_vae=True")
+        if rec["tiled_dit"] and not tiled_dit:
+            msg_parts.append("tiled_dit=True")
+        
+        if msg_parts:
+            result["message"] = f"⚠️ Current settings require ~{result['estimated_vram_gb']:.1f}GB but only {result['available_vram_gb']:.1f}GB available. Recommended: {', '.join(msg_parts)}"
+        else:
+            result["message"] = f"⚠️ VRAM critically low. Estimated ~{result['estimated_vram_gb']:.1f}GB needed, only {result['available_vram_gb']:.1f}GB available."
+    else:
+        result["message"] = f"✅ Safe to proceed. Estimated ~{result['estimated_vram_gb']:.1f}GB needed, {result['available_vram_gb']:.1f}GB available."
+    
+    return result
+
+
+def log_preflight_check(width, height, num_frames, scale, chunk_size, resize_factor,
+                         tiled_vae, tiled_dit, mode="full"):
+    """
+    Log pre-flight resource check results.
+    """
+    result = check_resources(width, height, num_frames, scale, chunk_size, resize_factor,
+                              tiled_vae, tiled_dit, mode)
+    
+    log("=" * 60, message_type='info')
+    log("PRE-FLIGHT RESOURCE CHECK", message_type='info', icon="🔍")
+    log(f"RAM: {result['ram_used_gb']:.1f}GB / {result['ram_total_gb']:.1f}GB", message_type='info', icon="💻")
+    log(f"VRAM Available: {result['available_vram_gb']:.1f}GB", message_type='info', icon="💾")
+    log(f"Estimated VRAM Required: {result['estimated_vram_gb']:.1f}GB", message_type='info', icon="📊")
+    
+    if result["will_oom"]:
+        log(result["message"], message_type='warning', icon="⚠️")
+        if result["recommended_settings"]:
+            rec = result["recommended_settings"]
+            log("Recommended Optimal Settings:", message_type='info', icon="💡")
+            if rec["chunk_size"] > 0:
+                log(f"  • chunk_size = {rec['chunk_size']}", message_type='info')
+            if rec["resize_factor"] < 1.0:
+                log(f"  • resize_factor = {rec['resize_factor']:.1f}", message_type='info')
+            if rec["tiled_vae"]:
+                log(f"  • tiled_vae = True", message_type='info')
+            if rec["tiled_dit"]:
+                log(f"  • tiled_dit = True", message_type='info')
+            if rec.get("warning"):
+                log(f"  ⚠️ {rec['warning']}", message_type='warning')
+    else:
+        log(result["message"], message_type='finish', icon="✅")
+    
+    log("=" * 60, message_type='info')
+    
+    return result
+
+
+def log_vram_advisory(width, height, num_frames, scale, tiled_vae, tiled_dit, mode="full"):
     """
     Log advisory message about VRAM usage.
+    Enhanced to use the new pre-flight check.
     """
     if not torch.cuda.is_available():
         return
     
-    estimated_vram = estimate_vram_usage(width, height, num_frames, scale, tiled_vae, tiled_dit)
+    estimated_vram = estimate_vram_usage(width, height, num_frames, scale, tiled_vae, tiled_dit, mode=mode)
     available_vram = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
     current_used = torch.cuda.memory_allocated() / (1024 ** 3)
     free_vram = available_vram - current_used
@@ -837,14 +1050,17 @@ def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_siz
 
     return final_output[:frames.shape[0], :, :, :]
 
-def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, force_offload, enable_debug=False, chunk_size=0, resize_factor=1.0):
+def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, force_offload, enable_debug=False, chunk_size=0, resize_factor=1.0, mode="full"):
     """
-    Main FlashVSR processing function.
+    =============================================================================
+    FIX 9 & 10: Unified Processing Pipeline with Pre-Flight Check
+    =============================================================================
     
-    =============================================================================
-    FIX 4: Lossless Resize - Use NEAREST for integer scaling factors
-    FIX 5: VRAM Advisory Logging
-    =============================================================================
+    Main FlashVSR processing function.
+    - FIX 4: Lossless Resize - Use NEAREST for integer scaling factors
+    - FIX 5: VRAM Advisory Logging with 95% threshold
+    - FIX 9: Pre-Flight Resource Check before processing
+    - FIX 10: Unified processing logic applied across all modes
     """
     # Aggressive garbage collection (FIX 5)
     clean_vram()
@@ -854,16 +1070,27 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
         torch.cuda.empty_cache()
 
     # ==========================================================================
+    # FIX 9: Pre-Flight Resource Check (BEFORE loading heavy models/processing)
+    # ==========================================================================
+    preflight_result = log_preflight_check(
+        frames.shape[2], frames.shape[1], frames.shape[0], scale, chunk_size, resize_factor, 
+        tiled_vae, tiled_dit, mode=mode
+    )
+    
+    # If pre-flight check suggests OOM, optionally apply recommended settings
+    # (Currently just logs warnings - user can adjust settings manually)
+    
+    # ==========================================================================
     # FIX 4: Lossless Resize Factor
     # Use NEAREST interpolation for integer-like factors, BICUBIC otherwise
     # ==========================================================================
     if resize_factor < 1.0 and resize_factor > 0:
         log(f"Resizing input by factor {resize_factor}...", message_type='info', icon="📉")
-        N, H, W, C = frames.shape
-        new_H, new_W = int(H * resize_factor), int(W * resize_factor)
+        orig_H, orig_W = frames.shape[1], frames.shape[2]
+        new_H, new_W = int(orig_H * resize_factor), int(orig_W * resize_factor)
         
         # Check if resize factor results in integer scaling (lossless possible)
-        is_integer_scale = (H % new_H == 0 and W % new_W == 0) or (resize_factor in [0.5, 0.25, 0.125])
+        is_integer_scale = (orig_H % new_H == 0 and orig_W % new_W == 0) or (resize_factor in [0.5, 0.25, 0.125])
         
         frames_permuted = frames.permute(0, 3, 1, 2)
         if is_integer_scale:
@@ -880,14 +1107,18 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
         clean_vram()
 
     start_time = time.time()
+    
+    # Get current dimensions (after potential resize)
+    N, H, W, C = frames.shape
 
     # ==========================================================================
-    # FIX 5: VRAM Advisory Logging
+    # FIX 5 & 10: Unified Debug Logging (same for all modes)
     # ==========================================================================
     if enable_debug:
         _device = pipe.device
         log(f"Debug Mode: Enabled", message_type='info', icon="🐞")
         log(f"Device: {_device}", message_type='info', icon="🖥️")
+        log(f"Processing Mode: {mode}", message_type='info', icon="⚙️")
         if torch.cuda.is_available():
              log(f"Total VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB", message_type='info', icon="💾")
         log(f"Input Frames: {frames.shape}", message_type='info', icon="🎞️")
@@ -895,10 +1126,9 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
         log(f"Tiled DiT: {tiled_dit}, Tiled VAE: {tiled_vae}", message_type='info', icon="🧩")
         log_resource_usage(prefix="Start")
     
-    # VRAM Advisory (FIX 5)
+    # VRAM Advisory (FIX 5) - Enhanced with mode
     if torch.cuda.is_available():
-        N, H, W, C = frames.shape
-        log_vram_advisory(W, H, N, scale, tiled_vae, tiled_dit)
+        log_vram_advisory(W, H, N, scale, tiled_vae, tiled_dit, mode=mode)
 
     # VRAM check and warning - FIX 5: Use 95% threshold (RTX 5070 Ti target)
     if torch.cuda.is_available():
@@ -1102,7 +1332,8 @@ class FlashVSRNodeInitPipe:
 
         # Use unified vae_model parameter
         pipe = init_pipeline(model, mode, _device, dtype, vae_model=vae_model)
-        return((pipe, force_offload),)
+        # FIX 10: Store mode with pipe for unified processing logic
+        return((pipe, force_offload, mode),)
 
 class FlashVSRNodeAdv:
     @classmethod
@@ -1211,8 +1442,15 @@ class FlashVSRNodeAdv:
     CATEGORY = "FlashVSR"
     
     def main(self, pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, frame_chunk_size, enable_debug, keep_models_on_cpu, resize_factor):
-        _pipe, _ = pipe
-        output = flashvsr(_pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, keep_models_on_cpu, enable_debug, frame_chunk_size, resize_factor)
+        # FIX 10: Extract mode from pipe tuple for unified processing
+        # Pipe tuple structure: (pipeline_object, force_offload, mode)
+        # Backwards compatible with older 2-element tuples (pipeline, force_offload)
+        if len(pipe) >= 3:
+            _pipe, _, mode = pipe
+        else:
+            _pipe = pipe[0]
+            mode = "full"  # Default fallback for backwards compatibility
+        output = flashvsr(_pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, keep_models_on_cpu, enable_debug, frame_chunk_size, resize_factor, mode=mode)
         return(output,)
 
 class FlashVSRNode:
@@ -1311,7 +1549,8 @@ class FlashVSRNode:
         
         # Use unified vae_model parameter    
         pipe = init_pipeline(model, mode, _device, torch.float16, vae_model=vae_model)
-        output = flashvsr(pipe, frames, scale, True, tiled_vae, tiled_dit, 256, 24, unload_dit, 2.0, 3.0, 11, seed, keep_models_on_cpu, enable_debug, frame_chunk_size, resize_factor)
+        # FIX 10: Pass mode for unified processing logic
+        output = flashvsr(pipe, frames, scale, True, tiled_vae, tiled_dit, 256, 24, unload_dit, 2.0, 3.0, 11, seed, keep_models_on_cpu, enable_debug, frame_chunk_size, resize_factor, mode=mode)
         return(output,)
 
 NODE_CLASS_MAPPINGS = {

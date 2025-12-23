@@ -375,15 +375,21 @@ class FlashVSRFullPipeline(BasePipeline):
         if self.prompt_emb_posi['stats'] == "offload":
             self.init_cross_kv(context_tensor=self.prompt_emb_posi['context'])
 
-        # Optimize VRAM: Only load DiT initially. VAE is loaded later.
-        self.load_models_to_device(["dit"])
+        # =======================================================================
+        # FIX: Use streaming decode approach (like tiny-long "gold standard")
+        # =======================================================================
+        # Load both DiT and VAE since we'll decode per-chunk
+        self.load_models_to_device(["dit", "vae"])
         self.dit.LQ_proj_in.to(self.device)
 
         # 清理可能存在的 LQ_proj_in cache
         if hasattr(self.dit, "LQ_proj_in"):
             self.dit.LQ_proj_in.clear_cache()
 
-        latents_total = []
+        # Track LQ frame indices like tiny-long (gold standard approach)
+        frames_total = []
+        LQ_pre_idx = 0
+        LQ_cur_idx = 0
         self.vae.clear_cache()
 
         with torch.no_grad():
@@ -404,6 +410,7 @@ class FlashVSRFullPipeline(BasePipeline):
                         else:
                             for layer_idx in range(len(LQ_latents)):
                                 LQ_latents[layer_idx] = torch.cat([LQ_latents[layer_idx], cur[layer_idx]], dim=1)
+                    LQ_cur_idx = (inner_loop_num-1)*4-3  # Track LQ frames like tiny-long
                     cur_latents = latents[:, :, :6, :, :]
                 else:
                     LQ_latents = None
@@ -419,6 +426,7 @@ class FlashVSRFullPipeline(BasePipeline):
                         else:
                             for layer_idx in range(len(LQ_latents)):
                                 LQ_latents[layer_idx] = torch.cat([LQ_latents[layer_idx], cur[layer_idx]], dim=1)
+                    LQ_cur_idx = cur_process_idx*8+21+(inner_loop_num-2)*4  # Track LQ frames like tiny-long
                     cur_latents = latents[:, :, 4+cur_process_idx*2:6+cur_process_idx*2, :, :]
 
                 # 推理（无 motion_controller / vace）
@@ -444,47 +452,45 @@ class FlashVSRFullPipeline(BasePipeline):
 
                 # 更新 latent
                 cur_latents = cur_latents - noise_pred_posi
-                latents_total.append(cur_latents)
+                
+                # =======================================================================
+                # FIX: Decode each chunk immediately (streaming approach like tiny-long)
+                # =======================================================================
+                cur_LQ_frame = LQ_video[:,:,LQ_pre_idx:LQ_cur_idx,:,:].to(self.device)
+                
+                # Use VAE streaming decode for per-chunk processing
+                # Note: stream_decode preserves cache across calls (unlike decode which clears it)
+                cur_frames = self.vae.stream_decode([cur_latents])
+                cur_frames = cur_frames.clamp_(-1, 1)  # Ensure proper range
+                
+                # 颜色校正（per-chunk, like tiny-long）
+                try:
+                    if color_fix:
+                        cur_frames = self.ColorCorrector(
+                            cur_frames.to(device=self.device),
+                            cur_LQ_frame,
+                            clip_range=(-1, 1),
+                            chunk_size=None,
+                            method='adain'
+                        )
+                except:
+                    pass
+                
+                frames_total.append(cur_frames.to('cpu'))
+                LQ_pre_idx = LQ_cur_idx
+                
+                if unload_dit:
+                    del noise_pred_posi, cur_frames, cur_latents, cur_LQ_frame
+                    clean_vram()
 
             if hasattr(self.dit, "LQ_proj_in"):
                 self.dit.LQ_proj_in.clear_cache()
-
-            if unload_dit and hasattr(self, 'dit') and not next(self.dit.parameters()).is_cpu:
-                if enable_debug_logging:
-                    print("[FlashVSR] Offloading DiT to the CPU to free up VRAM...")
-                # offload_model(keep_vae=True) calls load_models_to_device(["vae"]), effectively unloading DiT
-                self.offload_model(keep_vae=True)
-            else:
-                # If we are not forcing unload, we still need to ensure VAE is on device now.
-                # If we kept DiT, we load both. If we only need VAE, we load VAE.
-                # Since we didn't load VAE at start, we must load it now.
-                if enable_debug_logging:
-                    print("[FlashVSR] Loading VAE for decoding...")
-                self.load_models_to_device(["dit", "vae"])
-
-            latents = torch.cat(latents_total, dim=2)
-
-            # Decode
-            if enable_debug_logging:
-                print("[FlashVSR] Starting VAE decoding...")
-            frames = self.decode_video(latents, **tiler_kwargs)
 
             self.vae.clear_cache()
             if force_offload:
                 self.offload_model()
 
-            # 颜色校正（wavelet）
-            try:
-                if color_fix:
-                    frames = self.ColorCorrector(
-                        frames.to(device=LQ_video.device),
-                        LQ_video[:, :, :frames.shape[2], :, :],
-                        clip_range=(-1, 1),
-                        chunk_size=16,
-                        method='adain'
-                    )
-            except:
-                pass
+            frames = torch.cat(frames_total, dim=2)
 
         return frames[0]
 

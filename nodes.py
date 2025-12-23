@@ -229,7 +229,15 @@ def tensor_upscale_then_center_crop(frame_tensor: torch.Tensor, scale: int, tW: 
         pad_r = tW - sW - pad_left
         pad_b = tH - sH - pad_top
         # Pad order: (left, right, top, bottom)
-        upscaled_tensor = F.pad(upscaled_tensor, (pad_left, pad_r, pad_top, pad_b), mode='reflect')
+        # Use 'replicate' mode which is safer for small images than 'reflect'
+        # (reflect requires image size >= padding size on each dimension)
+        max_pad = max(pad_left, pad_r, pad_top, pad_b)
+        min_dim = min(upscaled_tensor.shape[2], upscaled_tensor.shape[3])
+        if min_dim >= max_pad:
+            upscaled_tensor = F.pad(upscaled_tensor, (pad_left, pad_r, pad_top, pad_b), mode='reflect')
+        else:
+            # Fall back to replicate mode for small images
+            upscaled_tensor = F.pad(upscaled_tensor, (pad_left, pad_r, pad_top, pad_b), mode='replicate')
     
     # Center crop to target dimensions if needed (should be exact after padding)
     l = max(0, (upscaled_tensor.shape[3] - tW) // 2)
@@ -392,8 +400,15 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1"):
         else:
             pipe.vae = WanVideoVAE(z_dim=VAE_Z_DIM, dim=VAE_FULL_DIM)
         
-        # Load state dict and move to device
-        pipe.vae.load_state_dict(sd, strict=False)
+        # Load state dict with logging for missing/unexpected keys
+        load_result = pipe.vae.load_state_dict(sd, strict=False)
+        if load_result.missing_keys:
+            log(f"VAE missing keys: {len(load_result.missing_keys)} (expected for LightX2V)", 
+                message_type='info', icon="ℹ️")
+        if load_result.unexpected_keys:
+            log(f"VAE unexpected keys: {len(load_result.unexpected_keys)}", 
+                message_type='info', icon="ℹ️")
+        
         pipe.vae = pipe.vae.to(device=device, dtype=dtype)
         
         log(f"Loaded VAE weights from: {vae_path}", message_type='info', icon="✅")
@@ -585,9 +600,15 @@ def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_siz
             # =================================================================
             # FIX 3: Crop output tile to remove padding before blending
             # =================================================================
-            # Crop from padded output to actual scaled tile dimensions
-            processed_tile_cpu = processed_tile_cpu[:, tile_pad_top:tile_pad_top + tile_sH, 
-                                                       tile_pad_left:tile_pad_left + tile_sW, :]
+            # Bounds checking to avoid IndexError
+            max_crop_h = min(tile_pad_top + tile_sH, processed_tile_cpu.shape[1])
+            max_crop_w = min(tile_pad_left + tile_sW, processed_tile_cpu.shape[2])
+            actual_h = max_crop_h - tile_pad_top
+            actual_w = max_crop_w - tile_pad_left
+            
+            if actual_h > 0 and actual_w > 0:
+                processed_tile_cpu = processed_tile_cpu[:, tile_pad_top:max_crop_h, 
+                                                           tile_pad_left:max_crop_w, :]
             
             if enable_debug:
                 tile_end = time.time()

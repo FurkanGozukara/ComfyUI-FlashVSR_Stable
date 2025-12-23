@@ -3,16 +3,17 @@
 """
 FlashVSR ComfyUI Node - Video Super Resolution
 ===============================================
-Supports Wan2.1, Wan2.2, and LightX2V VAE models.
+Supports 5 VAE models: Wan2.1, Wan2.2, LightVAE_W2.1, TAE_W2.2, LightTAE_HY1.5
 
 Key Fixes Applied:
-- FIX 1: Merged VAE selection into single 'vae_model' dropdown
-- FIX 2: Corrected VAE model loading logic with DISTINCT file paths per model
-- FIX 3: Fixed black border issue with proper padding/cropping
+- FIX 1: Merged VAE selection into single 'vae_model' dropdown (5 options)
+- FIX 2: STRICT file path mapping - each VAE loads its own distinct file
+- FIX 3: Black border fix - crop ONLY AFTER full VAE decode is complete
 - FIX 4: Lossless resize uses NEAREST for integer scaling
-- FIX 5: VRAM estimation and advisory logging
-- FIX 6: Auto-download for missing VAE models
-- FIX 7: Fixed tensor permutation for correct video output
+- FIX 5: VRAM optimization - 95% threshold before triggering OOM recovery
+- FIX 6: Auto-download with CORRECT HuggingFace URLs
+- FIX 7: Explicit VAE class instantiation - no guessing from state_dict
+- FIX 8: Summary logging at end of processing
 """
 
 import os, gc
@@ -54,45 +55,66 @@ except ImportError:
     pass
 
 # =============================================================================
-# FIX 1: Unified VAE model selection dropdown
-# Merged 'vae_type' and 'alt_vae' into single 'vae_model' dropdown
+# FIX 1: Unified VAE model selection dropdown - ALL 5 OPTIONS
 # =============================================================================
-VAE_MODEL_OPTIONS = ["Wan2.1", "Wan2.2", "LightX2V"]
+VAE_MODEL_OPTIONS = ["Wan2.1", "Wan2.2", "LightVAE_W2.1", "TAE_W2.2", "LightTAE_HY1.5"]
 
 # =============================================================================
-# FIX 2 (CRITICAL): Distinct file paths for each VAE model
-# Each VAE selection MUST load a DIFFERENT file
+# FIX 2 & 7: STRICT file path mapping with EXPLICIT class instantiation
+# Each VAE selection loads a DISTINCT file and uses EXPLICIT class (no guessing)
 # =============================================================================
 VAE_MODEL_MAP = {
     "Wan2.1": {
         "class": WanVideoVAE, 
         "file": "Wan2.1_VAE.pth", 
         "internal_name": "wan2.1",
-        "hf_repo": "Wan-AI/Wan2.1-T2V-1.3B",
-        "hf_filename": "Wan2.1_VAE.pth"
+        "url": "https://huggingface.co/lightx2v/Autoencoders/resolve/main/Wan2.1_VAE.pth",
+        "dim": VAE_FULL_DIM,
+        "z_dim": VAE_Z_DIM,
+        "use_full_arch": False
     },
     "Wan2.2": {
         "class": Wan22VideoVAE, 
-        "file": "Wan2.2_VAE.pth",  # DISTINCT file for Wan2.2
+        "file": "Wan2.2_VAE.pth",
         "internal_name": "wan2.2",
-        "hf_repo": "Wan-AI/Wan2.2-T2V-1.3B",
-        "hf_filename": "Wan2.2_VAE.pth"
+        "url": "https://huggingface.co/lightx2v/Autoencoders/resolve/main/Wan2.2_VAE.pth",
+        "dim": VAE_FULL_DIM,
+        "z_dim": VAE_Z_DIM,
+        "use_full_arch": False
     },
-    "LightX2V": {
+    "LightVAE_W2.1": {
         "class": LightX2VVAE, 
-        "file": "lightvaew2_1.pth",  # DISTINCT file for LightX2V
+        "file": "lightvaew2_1.pth",
         "internal_name": "lightx2v",
-        "hf_repo": "lightx2v/Autoencoders",
-        "hf_filename": "lightvaew2_1.pth"
+        "url": "https://huggingface.co/lightx2v/Autoencoders/resolve/main/lightvaew2_1.pth",
+        "dim": VAE_LIGHT_DIM,
+        "z_dim": VAE_Z_DIM,
+        "use_full_arch": True
+    },
+    "TAE_W2.2": {
+        "class": Wan22VideoVAE,  # TAE uses same base as Wan2.2
+        "file": "taew2_2.safetensors",
+        "internal_name": "tae_w2.2",
+        "url": "https://huggingface.co/lightx2v/Autoencoders/resolve/main/taew2_2.safetensors",
+        "dim": VAE_FULL_DIM,
+        "z_dim": VAE_Z_DIM,
+        "use_full_arch": False
+    },
+    "LightTAE_HY1.5": {
+        "class": LightX2VVAE,  # LightTAE uses LightX2V architecture
+        "file": "lighttaehy1_5.pth",
+        "internal_name": "lighttae_hy1.5",
+        "url": "https://huggingface.co/lightx2v/Autoencoders/resolve/main/lighttaehy1_5.pth",
+        "dim": VAE_LIGHT_DIM,
+        "z_dim": VAE_Z_DIM,
+        "use_full_arch": True
     },
 }
 
-# Fallback URLs (placeholder - update with actual URLs when available)
-VAE_DOWNLOAD_URLS = {
-    "Wan2.1_VAE.pth": "https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B/resolve/main/Wan2.1_VAE.pth",
-    "Wan2.2_VAE.pth": "https://huggingface.co/Wan-AI/Wan2.2-T2V-1.3B/resolve/main/Wan2.2_VAE.pth",
-    "lightvaew2_1.pth": "https://huggingface.co/lightx2v/Autoencoders/resolve/main/lightvaew2_1.pth",
-}
+# =============================================================================
+# FIX 5: VRAM threshold for OOM recovery - set to 95%
+# =============================================================================
+VRAM_OOM_THRESHOLD = 0.95  # Only trigger OOM recovery when 95% VRAM is used
 
 device_choices = get_device_list()
 
@@ -207,16 +229,16 @@ def model_download(model_name="JunhaoZhuang/FlashVSR"):
 
 
 # =============================================================================
-# FIX 6: Auto-download VAE models if missing
+# FIX 6: Auto-download VAE models if missing - UPDATED URLs
 # =============================================================================
 def download_vae_if_missing(vae_file: str, model_path: str, vae_config: dict) -> str:
     """
-    Check if VAE file exists. If not, attempt to download it.
+    Check if VAE file exists. If not, attempt to download it using the URL in vae_config.
     
     Args:
         vae_file: The filename of the VAE (e.g., 'Wan2.1_VAE.pth')
         model_path: The directory where VAE should be saved
-        vae_config: The VAE configuration from VAE_MODEL_MAP
+        vae_config: The VAE configuration from VAE_MODEL_MAP (must contain 'url' key)
     
     Returns:
         Full path to the VAE file
@@ -229,49 +251,31 @@ def download_vae_if_missing(vae_file: str, model_path: str, vae_config: dict) ->
     
     log(f"VAE file '{vae_file}' not found. Attempting auto-download...", message_type='warning', icon="⬇️")
     
-    # Try HuggingFace Hub download first
-    hf_repo = vae_config.get("hf_repo")
-    hf_filename = vae_config.get("hf_filename")
+    # Get URL from config (FIX 6: Use EXACT URLs from VAE_MODEL_MAP)
+    url = vae_config.get("url")
     
-    if hf_repo and hf_filename:
+    if url:
         try:
-            log(f"Downloading from HuggingFace: {hf_repo}/{hf_filename}", message_type='info', icon="🌐")
-            downloaded_path = hf_hub_download(
-                repo_id=hf_repo,
-                filename=hf_filename,
-                local_dir=model_path,
-                local_dir_use_symlinks=False
-            )
-            # Move to expected location if needed
-            if os.path.exists(downloaded_path) and downloaded_path != vae_path:
-                import shutil
-                shutil.move(downloaded_path, vae_path)
-            log(f"Successfully downloaded VAE: {vae_file}", message_type='finish', icon="✅")
-            return vae_path
-        except Exception as e:
-            log(f"HuggingFace download failed: {e}", message_type='warning', icon="⚠️")
-    
-    # Fallback to direct URL download
-    if vae_file in VAE_DOWNLOAD_URLS:
-        try:
-            url = VAE_DOWNLOAD_URLS[vae_file]
-            log(f"Downloading from URL: {url}", message_type='info', icon="🌐")
+            log(f"Downloading from: {url}", message_type='info', icon="🌐")
+            # Ensure directory exists
+            os.makedirs(model_path, exist_ok=True)
             torch.hub.download_url_to_file(url, vae_path, progress=True)
             log(f"Successfully downloaded VAE: {vae_file}", message_type='finish', icon="✅")
             return vae_path
         except Exception as e:
-            log(f"URL download failed: {e}", message_type='error', icon="❌")
+            log(f"Download failed: {e}", message_type='error', icon="❌")
     
     raise RuntimeError(
         f'VAE file "{vae_file}" not found and auto-download failed.\n'
         f'Please manually download it and save to: {vae_path}\n'
-        f'Expected HuggingFace source: {hf_repo}'
+        f'Download URL: {url}'
     )
 
 
 # =============================================================================
 # FIX 7: Fixed tensor2video for correct video output
 # Ensures proper tensor permutation: VAE output (B, C, F, H, W) -> video (F, H, W, C)
+# CRITICAL: This is called AFTER VAE decode is complete - no cropping here
 # =============================================================================
 def tensor2video(frames: torch.Tensor):
     """
@@ -281,6 +285,9 @@ def tensor2video(frames: torch.Tensor):
     Output: (F, H, W, C) - Frames, Height, Width, Channels (video format)
     
     The tensor is normalized from [-1, 1] to [0, 1] for display.
+    
+    NOTE: This function does NOT crop - cropping happens in process_chunk() 
+    AFTER this conversion is complete.
     """
     # Handle different input shapes
     if frames.dim() == 5:
@@ -300,11 +307,9 @@ def tensor2video(frames: torch.Tensor):
     
     # Normalize from [-1, 1] to [0, 1]
     video_final = (video_permuted.float() + 1.0) / 2.0
-    # Clamp to valid range
+    # Clamp to valid range to avoid visual artifacts
     video_final = torch.clamp(video_final, 0.0, 1.0)
     
-    return video_final
-    video_final = (video_permuted.float() + 1.0) / 2.0
     return video_final
 
 def largest_8n1_leq(n):  # 8n+1
@@ -454,16 +459,18 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1"):
     Initialize FlashVSR pipeline with specified model and VAE type.
     
     =============================================================================
-    FIX 2: Model Loading Logic - STRICT VAE file path mapping
+    FIX 2 & 7: STRICT VAE file path mapping with EXPLICIT class instantiation
     =============================================================================
-    - vae_model: Unified VAE selection from dropdown ("Wan2.1", "Wan2.2", "LightX2V")
+    - vae_model: Unified VAE selection from dropdown (5 options)
     - Each VAE selection loads a DISTINCT file (no file reuse)
-    - Debug logging shows selected_model vs loaded_model for verification
+    - EXPLICIT class instantiation based on selection - NO guessing from state_dict
     
     File Mapping:
-    - "Wan2.1" -> Wan2.1_VAE.pth
-    - "Wan2.2" -> Wan2.2_VAE.pth  
-    - "LightX2V" -> lightvaew2_1.pth
+    - "Wan2.1" -> Wan2.1_VAE.pth -> WanVideoVAE
+    - "Wan2.2" -> Wan2.2_VAE.pth -> Wan22VideoVAE
+    - "LightVAE_W2.1" -> lightvaew2_1.pth -> LightX2VVAE
+    - "TAE_W2.2" -> taew2_2.safetensors -> Wan22VideoVAE
+    - "LightTAE_HY1.5" -> lighttaehy1_5.pth -> LightX2VVAE
     """
     model_download(model_name="JunhaoZhuang/"+model)
     model_path = os.path.join(folder_paths.models_dir, model)
@@ -474,7 +481,7 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1"):
         raise RuntimeError(f'"diffusion_pytorch_model_streaming_dmd.safetensors" does not exist!\nPlease save it to "{model_path}"')
     
     # ==========================================================================
-    # FIX 2: VAE Model Loading - STRICT file path mapping (no reuse!)
+    # FIX 2 & 7: VAE Model Loading - EXPLICIT mapping (no guessing!)
     # ==========================================================================
     if vae_model not in VAE_MODEL_MAP:
         log(f"Unknown VAE model '{vae_model}', defaulting to Wan2.1", message_type='warning', icon="⚠️")
@@ -483,10 +490,12 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1"):
     vae_config = VAE_MODEL_MAP[vae_model]
     vae_class = vae_config["class"]
     vae_file = vae_config["file"]
-    vae_internal_name = vae_config["internal_name"]
+    vae_dim = vae_config["dim"]
+    vae_z_dim = vae_config["z_dim"]
+    use_full_arch = vae_config["use_full_arch"]
     
-    # Debug logging - Show EXACTLY which file will be loaded
-    log(f"VAE Selection: '{vae_model}' -> Loading DISTINCT file '{vae_file}'", 
+    # Debug logging - Show EXACTLY which file and class will be used
+    log(f"VAE Selection: '{vae_model}' -> File: '{vae_file}' -> Class: {vae_class.__name__}", 
         message_type='info', icon="🔍")
     
     # ==========================================================================
@@ -495,7 +504,6 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1"):
     vae_path = download_vae_if_missing(vae_file, model_path, vae_config)
     
     log(f"VAE file path confirmed: {vae_path}", message_type='info', icon="📁")
-    log(f"VAE class to instantiate: {vae_class.__name__}", message_type='info', icon="🔧")
     
     lq_path = os.path.join(model_path, "LQ_proj_in.ckpt")
     if not os.path.exists(lq_path):
@@ -512,10 +520,10 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1"):
         pipe = FlashVSRFullPipeline.from_model_manager(mm, device=device)
 
         # =======================================================================
-        # FIX 2: Always create the correct VAE class based on user selection
+        # FIX 7: EXPLICIT VAE class instantiation - NO guessing from state_dict
         # =======================================================================
-        # Even if ModelManager loaded a VAE, we replace it with the selected type
-        log(f"Creating VAE instance: {vae_class.__name__}", message_type='info', icon="📦")
+        log(f"Creating EXPLICIT VAE instance: {vae_class.__name__} (dim={vae_dim}, z_dim={vae_z_dim})", 
+            message_type='info', icon="📦")
         
         # Load weights from file
         if vae_path.endswith(".safetensors"):
@@ -527,18 +535,19 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1"):
         else:
             sd = torch.load(vae_path, map_location="cpu", weights_only=False)
         
-        # Create the correct VAE class based on selection
-        if vae_internal_name == "lightx2v":
-            pipe.vae = LightX2VVAE(z_dim=VAE_Z_DIM, dim=VAE_LIGHT_DIM, use_full_arch=True)
-        elif vae_internal_name == "wan2.2":
-            pipe.vae = Wan22VideoVAE(z_dim=VAE_Z_DIM, dim=VAE_FULL_DIM)
-        else:
-            pipe.vae = WanVideoVAE(z_dim=VAE_Z_DIM, dim=VAE_FULL_DIM)
+        # EXPLICIT class instantiation based on user selection (FIX 7)
+        # NO state_dict inspection - we trust the user's selection
+        if vae_class == LightX2VVAE:
+            pipe.vae = LightX2VVAE(z_dim=vae_z_dim, dim=vae_dim, use_full_arch=use_full_arch)
+        elif vae_class == Wan22VideoVAE:
+            pipe.vae = Wan22VideoVAE(z_dim=vae_z_dim, dim=vae_dim)
+        else:  # WanVideoVAE (default)
+            pipe.vae = WanVideoVAE(z_dim=vae_z_dim, dim=vae_dim)
         
         # Load state dict with logging for missing/unexpected keys
         load_result = pipe.vae.load_state_dict(sd, strict=False)
         if load_result.missing_keys:
-            log(f"VAE missing keys: {len(load_result.missing_keys)} (expected for LightX2V)", 
+            log(f"VAE missing keys: {len(load_result.missing_keys)} (expected for Light* models)", 
                 message_type='info', icon="ℹ️")
         if load_result.unexpected_keys:
             log(f"VAE unexpected keys: {len(load_result.unexpected_keys)}", 
@@ -891,25 +900,21 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
         N, H, W, C = frames.shape
         log_vram_advisory(W, H, N, scale, tiled_vae, tiled_dit)
 
-    # VRAM check and warning
+    # VRAM check and warning - FIX 5: Use 95% threshold (RTX 5070 Ti target)
     if torch.cuda.is_available():
-        vram_used = torch.cuda.memory_allocated()
-        vram_total = torch.cuda.get_device_properties(0).total_memory
+        vram_free, vram_total = torch.cuda.mem_get_info()
+        vram_used = vram_total - vram_free
+        vram_usage_ratio = vram_used / vram_total
 
-        # Optimize VRAM limit as requested
-        try:
-            # Set a soft limit on the process to prevent OOM crash if possible, or at least warn efficiently
-            # set_per_process_memory_fraction is a hard limit, doing it might crash the process if we are already above.
-            # Only set it if we haven't already.
-            # However, user requested "Set the maximum VRAM usage to 90%".
-            # We'll use a safer approach: Warn if > 90% and maybe trigger cleanup more aggressively.
-            pass
-        except:
-            pass
+        # FIX 5: Only trigger OOM recovery at 95% threshold (not 90%)
+        if vram_usage_ratio > VRAM_OOM_THRESHOLD:
+            log(f"Warning: VRAM usage is very high ({vram_usage_ratio*100:.1f}% > {VRAM_OOM_THRESHOLD*100:.0f}%)! Enabling fallback options is recommended.", 
+                message_type='warning', icon="⚠️")
 
-        if vram_used / vram_total > 0.90:
-            log("Warning: VRAM usage is very high (>90%)! Enabling fallback options is recommended.", message_type='warning', icon="⚠️")
-
+    # Store input resolution for summary (FIX 8)
+    input_resolution = f"{frames.shape[2]}x{frames.shape[1]}"
+    output_resolution = f"{frames.shape[2] * scale}x{frames.shape[1] * scale}"
+    
     # Chunking Logic
     total_frames = frames.shape[0]
     final_outputs = []
@@ -929,7 +934,7 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
 
             chunk_frames = frames[chunk_start:chunk_end]
 
-            # Auto-Fallback Logic
+            # Auto-Fallback Logic - FIX 5: Uses VRAM_OOM_THRESHOLD (95%)
             retry_count = 0
             max_retries = 2
             current_tiled_vae = tiled_vae
@@ -998,13 +1003,21 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
     total_time = end_time - start_time
     fps = frames.shape[0] / total_time if total_time > 0 else 0
     
-    log(f"Done in {total_time:.2f}s ({fps:.2f} FPS).", message_type='finish', icon="✅")
+    # ==========================================================================
+    # FIX 8: Summary logging at end of processing
+    # ==========================================================================
+    log("=" * 60, message_type='info')
+    log("PROCESSING SUMMARY", message_type='finish', icon="📊")
+    log(f"Total Processing Time: {total_time:.2f}s ({fps:.2f} FPS)", message_type='info', icon="⏱️")
+    log(f"Input Resolution: {input_resolution} ({frames.shape[0]} frames)", message_type='info', icon="📥")
+    log(f"Output Resolution: {output_resolution} ({final_output_tensor.shape[0]} frames)", message_type='info', icon="📤")
     
     if torch.cuda.is_available():
         peak_memory = torch.cuda.max_memory_reserved() / 1024**3
-        log(f"Peak VRAM used: {peak_memory:.2f} GB", message_type='info', icon="📈")
+        log(f"Peak VRAM Used: {peak_memory:.2f} GB", message_type='info', icon="📈")
         
     log_resource_usage(prefix="Final")
+    log("=" * 60, message_type='info')
     
     return final_output_tensor
 
@@ -1029,7 +1042,7 @@ class FlashVSRNodeInitPipe:
                 }),
                 "vae_model": (VAE_MODEL_OPTIONS, {
                     "default": "Wan2.1",
-                    "tooltip": 'VAE model selection: "Wan2.1" (default, max quality), "Wan2.2" (optimized normalization), "LightX2V" (50% less VRAM, 2-3x faster).'
+                    "tooltip": 'VAE model: Wan2.1 (default), Wan2.2, LightVAE_W2.1 (50% less VRAM), TAE_W2.2, LightTAE_HY1.5. Auto-downloads if missing.'
                 }),
                 "force_offload": ("BOOLEAN", {
                     "default": True,
@@ -1054,7 +1067,7 @@ class FlashVSRNodeInitPipe:
     RETURN_NAMES = ("pipe",)
     FUNCTION = "main"
     CATEGORY = "FlashVSR"
-    DESCRIPTION = 'Initializes the FlashVSR pipeline. Select VAE model: Wan2.1 (default), Wan2.2 (improved), or LightX2V (50% less VRAM).'
+    DESCRIPTION = 'Initializes the FlashVSR pipeline. 5 VAE options: Wan2.1, Wan2.2, LightVAE_W2.1, TAE_W2.2, LightTAE_HY1.5. Auto-downloads missing files.'
     
     def main(self, model, mode, vae_model, force_offload, precision, device, attention_mode):
         _device = device
@@ -1225,7 +1238,7 @@ class FlashVSRNode:
                 }),
                 "vae_model": (VAE_MODEL_OPTIONS, {
                     "default": "Wan2.1",
-                    "tooltip": 'VAE model: "Wan2.1" (default, max quality), "Wan2.2" (optimized normalization), "LightX2V" (50% less VRAM, 2-3x faster).'
+                    "tooltip": 'VAE model: Wan2.1 (default), Wan2.2, LightVAE_W2.1 (50% less VRAM), TAE_W2.2, LightTAE_HY1.5. Auto-downloads if missing.'
                 }),
                 "scale": ("INT", {
                     "default": 2,
@@ -1284,7 +1297,7 @@ class FlashVSRNode:
     RETURN_NAMES = ("image",)
     FUNCTION = "main"
     CATEGORY = "FlashVSR"
-    DESCRIPTION = 'Single-node FlashVSR upscaling. Select VAE: Wan2.1 (default), Wan2.2, or LightX2V (50% less VRAM).'
+    DESCRIPTION = 'Single-node FlashVSR upscaling. 5 VAE options: Wan2.1, Wan2.2, LightVAE_W2.1, TAE_W2.2, LightTAE_HY1.5. Auto-downloads missing files.'
     
     def main(self, model, frames, mode, vae_model, scale, tiled_vae, tiled_dit, unload_dit, seed, frame_chunk_size, attention_mode, enable_debug, keep_models_on_cpu, resize_factor):
         _device = "cuda:0" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "auto"

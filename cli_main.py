@@ -439,6 +439,11 @@ def format_time(seconds):
 
 def main():
     args = parse_args()
+
+    # Safety check: ensure output file does not already exist
+    if os.path.exists(args.output):
+        print(f"Error: Output file '{args.output}' already exists. Aborting to prevent overwrite.", file=sys.stderr)
+        sys.exit(1)
     
     # Handle boolean flag pairs
     force_offload = args.force_offload and not args.no_force_offload
@@ -459,7 +464,6 @@ def main():
     # ==========================================================================
     
     # Mock ComfyUI modules for standalone CLI operation
-    import sys
     from unittest.mock import MagicMock
     
     # Create mock folder_paths module

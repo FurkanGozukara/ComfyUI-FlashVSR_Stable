@@ -424,6 +424,14 @@ class VideoWriter:
         if self.out:
             self.out.release()
 
+def format_time(seconds):
+    """
+    Format seconds into HH:MM:SS or MM:SS
+    """
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}"
+
 
 # =============================================================================
 # Main CLI entry point
@@ -563,7 +571,26 @@ def main():
         start_time_glob = time.time()
         
         for chunk_idx, frames in enumerate(reader):
-            print(f"\n--- Processing Chunk {chunk_idx+1} ({frames.shape[0]} frames) ---")
+            # Calculate progress metrics
+            elapsed = time.time() - start_time_glob
+            
+            # Speed (fps) - avoid division by zero
+            if total_processed > 0 and elapsed > 0:
+                speed_fps = total_processed / elapsed
+                remaining_frames = total_frames_to_process - total_processed
+                eta_seconds = remaining_frames / speed_fps
+            else:
+                speed_fps = 0.0
+                eta_seconds = 0
+            
+            formatted_elapsed = format_time(elapsed)
+            formatted_eta = format_time(eta_seconds)
+            
+            # Print status for the *current state* (before processing this chunk)
+            # format: Progress:   8.34% | Processed: 6464/77514 | Elapsed: 1:34:31 | ETA: 0:12:10 | Speed: 1.25 fps
+            progress_pct = (total_processed / total_frames_to_process) * 100 if total_frames_to_process > 0 else 0
+            print(f"Progress: {progress_pct:6.2f}% | Processed: {total_processed}/{total_frames_to_process} | "
+                  f"Elapsed: {formatted_elapsed} | ETA: {formatted_eta} | Speed: {speed_fps:.2f} fps")
             
             # Process the chunk
             # Note: We pass chunk_size=0 to flashvsr because we are feeding it an explicit chunk
@@ -582,7 +609,7 @@ def main():
                 kv_ratio=args.kv_ratio,
                 local_range=args.local_range,
                 seed=args.seed,
-        force_offload=keep_models_on_cpu,  # flashvsr() uses force_offload param for CPU offloading
+                force_offload=keep_models_on_cpu,  # flashvsr() uses force_offload param for CPU offloading
                 enable_debug=args.enable_debug,
                 chunk_size=0, # Already chunked
                 resize_factor=args.resize_factor,
@@ -637,8 +664,8 @@ def main():
     
     print("\n" + "=" * 60)
     print("FlashVSR processing complete!")
-    print(f"Total Frames Processed: {total_processed}")
-    print(f"Total Time: {total_duration:.2f}s ({avg_fps:.2f} FPS)")
+    print(f"Total Frames Processed: {total_processed}/{total_frames_to_process}")
+    print(f"Total Time: {format_time(total_duration)} ({avg_fps:.2f} FPS)")
     print("=" * 60)
 
 

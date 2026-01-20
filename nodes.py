@@ -1491,7 +1491,7 @@ class FlashVSRNodeAdv:
             _pipe = pipe[0]
             mode = "full"  # Default fallback for backwards compatibility
         output = flashvsr(_pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, keep_models_on_cpu, enable_debug, frame_chunk_size, resize_factor, mode=mode)
-        return(output,)
+        return(output.cpu().float(),)
 
 class FlashVSRNode:
     """
@@ -1591,7 +1591,7 @@ class FlashVSRNode:
         pipe = init_pipeline(model, mode, _device, torch.float16, vae_model=vae_model)
         # FIX 10: Pass mode for unified processing logic
         output = flashvsr(pipe, frames, scale, True, tiled_vae, tiled_dit, 256, 24, unload_dit, 2.0, 3.0, 11, seed, keep_models_on_cpu, enable_debug, frame_chunk_size, resize_factor, mode=mode)
-        return(output,)
+        return(output.cpu().float(),)
 
 NODE_CLASS_MAPPINGS = {
     "FlashVSRNode": FlashVSRNode,

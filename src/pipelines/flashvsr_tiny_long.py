@@ -336,7 +336,7 @@ class FlashVSRTinyLongPipeline(BasePipeline):
         if force_offload and not self.cpu_offload:
             self.enable_cpu_offload()
         elif not force_offload and self.cpu_offload:
-            self.cpu_offload = False
+            self.disable_cpu_offload()
         
         # 只接受 cfg=1.0（与原代码一致）
         assert cfg_scale == 1.0, "cfg_scale must be 1.0"

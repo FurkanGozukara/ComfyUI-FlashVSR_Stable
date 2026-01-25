@@ -326,14 +326,6 @@ ComfyUI/models/FlashVSR/
 
 See [CHANGELOG.md](CHANGELOG.md) for full version history.
 
-### v1.2.7 (2025-12-23)
-- 🚀 Pre-Flight Resource Calculator with settings recommendations
-- 🎨 5 VAE options: Wan2.1, Wan2.2, LightVAE_W2.1, TAE_W2.2, LightTAE_HY1.5
-- ⬇️ Auto-download VAE models from HuggingFace
-- 🐛 Fixed black borders and video corruption
-- ⚡ Unified processing pipeline for all modes
-- 🛡️ 95% VRAM threshold for OOM recovery
-
 ---
 
 ## 🙏 Acknowledgments

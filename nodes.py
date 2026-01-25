@@ -1495,6 +1495,9 @@ class FlashVSRNodeAdv:
         
         # Use keep_models_on_cpu parameter (node-level setting takes precedence)
         # This allows users to override the init pipe setting per execution
+        # Note: keep_models_on_cpu and force_offload are semantically equivalent:
+        #  - keep_models_on_cpu=True means offload to CPU (force_offload=True)
+        #  - keep_models_on_cpu=False means keep in VRAM (force_offload=False)
         output = flashvsr(_pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, keep_models_on_cpu, enable_debug, frame_chunk_size, resize_factor, mode=mode)
         return(output.cpu().float(),)
 

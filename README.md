@@ -217,6 +217,10 @@ python cli_main.py --input long_video.mp4 --output upscaled.mp4 \
 python cli_main.py --input video.mp4 --output upscaled.mp4 --scale 2 \
     --vae_model LightVAE_W2.1 --tiled_vae --tiled_dit \
     --frame_chunk_size 20 --resize_factor 0.5
+
+# Custom models directory
+python cli_main.py --input video.mp4 --output upscaled.mp4 \
+    --models_dir /path/to/your/models
 ```
 
 ### CLI Arguments Reference
@@ -309,6 +313,35 @@ ComfyUI/models/FlashVSR/
 ```
 
 > 💡 **VAE files auto-download** from HuggingFace if not present. Only the DiT model and other components need manual download.
+
+### Step 3: Custom Model Paths (Optional)
+
+By default, FlashVSR looks for models in `ComfyUI/models/FlashVSR/`. To use a different location (e.g., models on another drive):
+
+1. Edit `model_paths.yaml` in the `ComfyUI-FlashVSR_Stable` directory
+2. Set `flashvsr_model_path` to your custom path
+3. Restart ComfyUI
+
+**Example configurations:**
+
+```yaml
+# Windows (D: drive)
+flashvsr_model_path: "D:/AI/Models/FlashVSR"
+
+# Windows (alternative syntax)
+flashvsr_model_path: "E:\\ComfyUI\\models\\FlashVSR"
+
+# Linux/Mac
+flashvsr_model_path: "/home/user/models/FlashVSR"
+flashvsr_model_path: "/mnt/storage/AI/FlashVSR"
+
+# Use default (leave empty)
+flashvsr_model_path: ""
+```
+
+> 📂 **Auto-Download Support**: If model files don't exist, they will automatically download to the directory specified in `model_paths.yaml`. The custom path will be created if needed.
+> 
+> **Example**: If you set `flashvsr_model_path: "D:/AI/Models"`, models will automatically download to `D:/AI/Models/FlashVSR/` on first use.
 
 ---
 

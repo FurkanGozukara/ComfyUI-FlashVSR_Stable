@@ -24,6 +24,8 @@ import comfy.utils
 import time
 import sys
 import psutil
+import yaml
+import threading
 
 import numpy as np
 import torch.nn.functional as F
@@ -115,6 +117,68 @@ VAE_MODEL_MAP = {
 # FIX 5: VRAM threshold for OOM recovery - set to 95%
 # =============================================================================
 VRAM_OOM_THRESHOLD = 0.95  # Only trigger OOM recovery when 95% VRAM is used
+
+# =============================================================================
+# Model Paths Configuration Loader
+# =============================================================================
+_cached_model_path = None  # Cache for model path to avoid repeated file reads
+_config_loaded = False  # Flag to track if we've attempted to load config
+_config_lock = threading.Lock()  # Thread-safe access to cached values
+
+def load_model_paths_config():
+    """
+    Load model paths configuration from model_paths.yaml file.
+    Returns the custom FlashVSR model path if configured, otherwise None.
+    Uses caching to avoid repeated file I/O operations.
+    Thread-safe implementation using a lock.
+    """
+    global _cached_model_path, _config_loaded
+    
+    # Return cached value if already loaded (thread-safe check)
+    with _config_lock:
+        if _config_loaded:
+            return _cached_model_path
+    
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    config_path = os.path.join(current_dir, "model_paths.yaml")
+    
+    # Check if file exists before entering try block
+    if not os.path.exists(config_path):
+        with _config_lock:
+            _config_loaded = True
+        return None
+    
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = yaml.safe_load(f)
+            
+        if config and isinstance(config, dict):
+            flashvsr_path = config.get('flashvsr_model_path', '').strip()
+            
+            if flashvsr_path:
+                # Expand user path (~/...) and environment variables
+                flashvsr_path = os.path.expanduser(flashvsr_path)
+                flashvsr_path = os.path.expandvars(flashvsr_path)
+                
+                # Convert to absolute path if it's not already
+                # Use current_dir (plugin directory) as base for relative paths
+                if not os.path.isabs(flashvsr_path):
+                    flashvsr_path = os.path.abspath(os.path.join(current_dir, flashvsr_path))
+                
+                log(f"Custom FlashVSR model path loaded from config: {flashvsr_path}", 
+                    message_type='info', icon="📂")
+                
+                with _config_lock:
+                    _cached_model_path = flashvsr_path
+                    _config_loaded = True
+                return flashvsr_path
+    except Exception as e:
+        log(f"Warning: Could not load model_paths.yaml: {e}. Using default path.", 
+            message_type='warning', icon="⚠️")
+    
+    with _config_lock:
+        _config_loaded = True
+    return None
 
 device_choices = get_device_list()
 
@@ -456,8 +520,19 @@ def log_vram_advisory(width, height, num_frames, scale, tiled_vae, tiled_dit, mo
     elif estimated_vram < free_vram * 0.5:
         log("✅ Safe to proceed. VRAM usage should be comfortable.", message_type='info', icon="✅")
 
+def get_flashvsr_model_base_dir():
+    """
+    Get the base directory for FlashVSR models.
+    Checks model_paths.yaml first, falls back to ComfyUI models directory.
+    """
+    custom_path = load_model_paths_config()
+    if custom_path:
+        return custom_path
+    return folder_paths.models_dir
+
 def model_download(model_name="JunhaoZhuang/FlashVSR"):
-    model_dir = os.path.join(folder_paths.models_dir, model_name.split("/")[-1])
+    base_dir = get_flashvsr_model_base_dir()
+    model_dir = os.path.join(base_dir, model_name.split("/")[-1])
     if not os.path.exists(model_dir):
         log(f"Downloading model '{model_name}' from huggingface...", message_type='info', icon="⬇️")
         snapshot_download(repo_id=model_name, local_dir=model_dir, local_dir_use_symlinks=False, resume_download=True)
@@ -708,7 +783,8 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1"):
     - "LightTAE_HY1.5" -> lighttaehy1_5.pth -> LightX2VVAE
     """
     model_download(model_name="JunhaoZhuang/"+model)
-    model_path = os.path.join(folder_paths.models_dir, model)
+    base_dir = get_flashvsr_model_base_dir()
+    model_path = os.path.join(base_dir, model)
     if not os.path.exists(model_path):
         raise RuntimeError(f'Model directory does not exist!\nPlease save all weights to "{model_path}"')
     ckpt_path = os.path.join(model_path, "diffusion_pytorch_model_streaming_dmd.safetensors")

@@ -339,7 +339,9 @@ flashvsr_model_path: "/mnt/storage/AI/FlashVSR"
 flashvsr_model_path: ""
 ```
 
-> 📂 The custom path should contain the same structure as the default models directory.
+> 📂 **Auto-Download Support**: If model files don't exist, they will automatically download to the directory specified in `model_paths.yaml`. The custom path will be created if needed.
+> 
+> **Example**: If you set `flashvsr_model_path: "D:/AI/Models"`, models will automatically download to `D:/AI/Models/FlashVSR/` on first use.
 
 ---
 

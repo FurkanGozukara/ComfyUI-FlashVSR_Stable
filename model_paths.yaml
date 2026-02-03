@@ -32,10 +32,18 @@ flashvsr_model_path: ""
 # =============================================================================
 # NOTES:
 # - After changing this file, restart ComfyUI for changes to take effect
-# - Ensure the directory exists and is readable/writable
+# - The directory will be automatically created if it doesn't exist
+# - AUTO-DOWNLOAD: If model files are missing, they will be automatically
+#   downloaded to the directory specified above (or default if empty)
 # - The directory should contain the FlashVSR model files:
-#   - diffusion_pytorch_model_streaming_dmd.safetensors
-#   - LQ_proj_in.ckpt
-#   - TCDecoder.ckpt
-#   - VAE files (auto-downloaded if missing)
+#   - diffusion_pytorch_model_streaming_dmd.safetensors (auto-downloads from HuggingFace)
+#   - LQ_proj_in.ckpt (auto-downloads from HuggingFace)
+#   - TCDecoder.ckpt (auto-downloads from HuggingFace)
+#   - VAE files (auto-download on first use if missing)
+#
+# EXAMPLE WORKFLOW:
+# 1. Set flashvsr_model_path: "D:/AI/Models"
+# 2. Restart ComfyUI
+# 3. First use: Models automatically download to D:/AI/Models/FlashVSR/
+# 4. Subsequent uses: Models load from D:/AI/Models/FlashVSR/
 # =============================================================================

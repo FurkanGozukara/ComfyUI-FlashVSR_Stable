@@ -6,6 +6,54 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [1.3.0] - 2026-02-03
+
+### 🚀 New Features
+
+- **Custom Model Paths Configuration**: Added `model_paths.yaml` configuration file to specify custom directories for FlashVSR models.
+  - Allows storing models on different drives (e.g., D:, E:) without code modification
+  - Supports Windows (forward slashes and backslashes), Linux, and Mac path formats
+  - Automatic directory creation if path doesn't exist
+  - Path expansion support (`~` for home directory, environment variables)
+
+- **Auto-Download to Custom Paths**: Model auto-download now respects the custom path configured in `model_paths.yaml`.
+  - When models don't exist, they automatically download to the configured directory
+  - All model files (DiT, LQ_proj, TCDecoder, VAE) download to custom path
+  - Falls back to default ComfyUI models directory if config is empty
+
+### ⚡ Performance
+
+- **Configuration Caching**: Thread-safe module-level caching prevents repeated file I/O operations
+- **Optimized Path Resolution**: Configuration loaded once at startup and cached for all subsequent operations
+
+### 🛠 Technical Implementation
+
+- Added `load_model_paths_config()`: Thread-safe YAML configuration loader with caching
+- Added `get_flashvsr_model_base_dir()`: Helper function to resolve model base directory
+- Updated `model_download()` to use custom path from configuration
+- Updated `init_pipeline()` to construct paths using configuration
+- Thread safety implemented with `threading.Lock()` for concurrent node loading
+- Security: Uses `yaml.safe_load()` to prevent code injection
+
+### 📖 Documentation
+
+- Added comprehensive `model_paths.yaml` with:
+  - Detailed instructions for Windows/Linux/Mac users
+  - Multiple practical examples for different scenarios
+  - Auto-download workflow explanation
+  - Turkish and English documentation
+- Updated README.md with:
+  - "Step 3: Custom Model Paths" installation section
+  - Auto-download support callout with examples
+  - CLI usage examples with `--models_dir` parameter
+- Added inline code comments explaining the configuration flow
+
+### 🔧 Dependencies
+
+- Added `pyyaml` to requirements.txt for YAML configuration parsing
+
+---
+
 ## [1.2.9] - 2026-01-25
 
 ### 🐛 Bug Fixes

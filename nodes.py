@@ -25,6 +25,7 @@ import time
 import sys
 import psutil
 import yaml
+import threading
 
 import numpy as np
 import torch.nn.functional as F
@@ -122,25 +123,29 @@ VRAM_OOM_THRESHOLD = 0.95  # Only trigger OOM recovery when 95% VRAM is used
 # =============================================================================
 _cached_model_path = None  # Cache for model path to avoid repeated file reads
 _config_loaded = False  # Flag to track if we've attempted to load config
+_config_lock = threading.Lock()  # Thread-safe access to cached values
 
 def load_model_paths_config():
     """
     Load model paths configuration from model_paths.yaml file.
     Returns the custom FlashVSR model path if configured, otherwise None.
     Uses caching to avoid repeated file I/O operations.
+    Thread-safe implementation using a lock.
     """
     global _cached_model_path, _config_loaded
     
-    # Return cached value if already loaded
-    if _config_loaded:
-        return _cached_model_path
+    # Return cached value if already loaded (thread-safe check)
+    with _config_lock:
+        if _config_loaded:
+            return _cached_model_path
     
     current_dir = os.path.dirname(os.path.abspath(__file__))
     config_path = os.path.join(current_dir, "model_paths.yaml")
     
     # Check if file exists before entering try block
     if not os.path.exists(config_path):
-        _config_loaded = True
+        with _config_lock:
+            _config_loaded = True
         return None
     
     try:
@@ -156,19 +161,23 @@ def load_model_paths_config():
                 flashvsr_path = os.path.expandvars(flashvsr_path)
                 
                 # Convert to absolute path if it's not already
+                # Use current_dir (plugin directory) as base for relative paths
                 if not os.path.isabs(flashvsr_path):
-                    flashvsr_path = os.path.abspath(flashvsr_path)
+                    flashvsr_path = os.path.abspath(os.path.join(current_dir, flashvsr_path))
                 
                 log(f"Custom FlashVSR model path loaded from config: {flashvsr_path}", 
                     message_type='info', icon="📂")
-                _cached_model_path = flashvsr_path
-                _config_loaded = True
+                
+                with _config_lock:
+                    _cached_model_path = flashvsr_path
+                    _config_loaded = True
                 return flashvsr_path
     except Exception as e:
         log(f"Warning: Could not load model_paths.yaml: {e}. Using default path.", 
             message_type='warning', icon="⚠️")
     
-    _config_loaded = True
+    with _config_lock:
+        _config_loaded = True
     return None
 
 device_choices = get_device_list()

@@ -12,9 +12,9 @@
 #
 # EXAMPLES:
 # ---------
-# Windows (different drive):
-#   flashvsr_model_path: "D:/AI/Models/FlashVSR"
-#   flashvsr_model_path: "E:\\ComfyUI\\models\\FlashVSR"
+# Windows (different drive) - Both formats are equivalent:
+#   flashvsr_model_path: "D:/AI/Models/FlashVSR"        # Recommended (forward slashes)
+#   flashvsr_model_path: "E:\\ComfyUI\\models\\FlashVSR"  # Alternative (escaped backslashes)
 #
 # Linux/Mac:
 #   flashvsr_model_path: "/home/user/models/FlashVSR"

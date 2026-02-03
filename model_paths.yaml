@@ -1,0 +1,41 @@
+# =============================================================================
+# FlashVSR Model Paths Configuration
+# =============================================================================
+# This file allows you to customize where FlashVSR models are stored.
+# By default, models are stored in ComfyUI's models directory.
+#
+# INSTRUCTIONS:
+# -------------
+# 1. To change the model directory, modify the 'flashvsr_model_path' below
+# 2. Use absolute paths (full path from drive root)
+# 3. Use forward slashes (/) even on Windows, or double backslashes (\\)
+#
+# EXAMPLES:
+# ---------
+# Windows (different drive):
+#   flashvsr_model_path: "D:/AI/Models/FlashVSR"
+#   flashvsr_model_path: "E:\\ComfyUI\\models\\FlashVSR"
+#
+# Linux/Mac:
+#   flashvsr_model_path: "/home/user/models/FlashVSR"
+#   flashvsr_model_path: "/mnt/storage/AI/FlashVSR"
+#
+# Use default ComfyUI models directory (leave empty or comment out):
+#   flashvsr_model_path: ""
+#
+# =============================================================================
+
+# FlashVSR model directory path
+# Leave empty ("") to use ComfyUI's default models directory
+flashvsr_model_path: ""
+
+# =============================================================================
+# NOTES:
+# - After changing this file, restart ComfyUI for changes to take effect
+# - Ensure the directory exists and is readable/writable
+# - The directory should contain the FlashVSR model files:
+#   - diffusion_pytorch_model_streaming_dmd.safetensors
+#   - LQ_proj_in.ckpt
+#   - TCDecoder.ckpt
+#   - VAE files (auto-downloaded if missing)
+# =============================================================================

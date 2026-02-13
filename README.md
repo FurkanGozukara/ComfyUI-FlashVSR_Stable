@@ -28,7 +28,7 @@ Registry Link: https://registry.comfy.org/publishers/naxci1/nodes/ComfyUI-FlashV
 
 - [Changelog](CHANGELOG.md) - Full version history
 - [Sample Workflow](./workflow/FlashVSR.json)
-- [HuggingFace Models](https://huggingface.co/JunhaoZhuang/FlashVSR)
+- [HuggingFace Models](https://huggingface.co/JunhaoZhuang/FlashVSR-v1.1)
 
 ---
 
@@ -302,7 +302,7 @@ python -m pip install -r ComfyUI-FlashVSR_Stable/requirements.txt
 
 ### Step 2: Download Models
 
-Download the `FlashVSR` folder from [HuggingFace](https://huggingface.co/JunhaoZhuang/FlashVSR):
+Download the `FlashVSR` folder from [HuggingFace](https://huggingface.co/JunhaoZhuang/FlashVSR-v1.1):
 
 ```
 ComfyUI/models/FlashVSR/

@@ -38,6 +38,33 @@ from PIL import Image
 import numpy as np
 
 USE_BLOCK_ATTN = False
+ATTENTION_MODE = "sparse_sage_attention"
+_ATTN_WARNED: set[str] = set()
+
+
+def _resolve_attention_mode() -> str:
+    raw = str(globals().get("ATTENTION_MODE", "sparse_sage_attention") or "sparse_sage_attention").strip().lower()
+    alias = {
+        "sparse_sage": "sparse_sage_attention",
+        "sparse_sage_attention": "sparse_sage_attention",
+        "block_sparse": "block_sparse_attention",
+        "block_sparse_attention": "block_sparse_attention",
+        "flash_attn_2": "flash_attention_2",
+        "flash_attention_2": "flash_attention_2",
+        "sdpa": "sdpa",
+    }
+    return alias.get(raw, "sparse_sage_attention")
+
+
+def _warn_attention_once(message: str) -> None:
+    msg = str(message or "").strip()
+    if not msg or msg in _ATTN_WARNED:
+        return
+    _ATTN_WARNED.add(msg)
+    try:
+        print(f"[wan_video_dit] {msg}", flush=True)
+    except Exception:
+        pass
 
 # ----------------------------
 # Local / window masks
@@ -221,10 +248,20 @@ def generate_draft_block_mask_sage(batch_size, nheads, seqlen,
 # Attention kernels
 # ----------------------------
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, compatibility_mode=False, attention_mask=None, return_KV=False):
-    if attention_mask is not None:
+    mode = _resolve_attention_mode()
+
+    # Sparse paths require the draft mask built by FlashVSR's local sparse logic.
+    if attention_mask is not None and mode in {"sparse_sage_attention", "block_sparse_attention"}:
         seqlen = q.shape[1]
         seqlen_kv = k.shape[1]
-        if USE_BLOCK_ATTN and BLOCK_ATTN_AVAILABLE:
+        use_block_sparse = mode == "block_sparse_attention" and BLOCK_ATTN_AVAILABLE
+        if mode == "block_sparse_attention" and not BLOCK_ATTN_AVAILABLE:
+            _warn_attention_once(
+                "Requested block_sparse_attention, but block_sparse_attn is unavailable; "
+                "falling back to sparse_sage_attention."
+            )
+
+        if use_block_sparse:
             q = rearrange(q, "b s (n d) -> (b s) n d", n=num_heads)
             k = rearrange(k, "b s (n d) -> (b s) n d", n=num_heads)
             v = rearrange(v, "b s (n d) -> (b s) n d", n=num_heads)
@@ -232,15 +269,17 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads
             q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
             k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
             v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
+
         cu_seqlens_q = torch.tensor([0, seqlen], device=q.device, dtype=torch.int32)
         cu_seqlens_k = torch.tensor([0, seqlen_kv], device=q.device, dtype=torch.int32)
-        head_mask_type = torch.tensor([1]*num_heads, device=q.device, dtype=torch.int32)
+        head_mask_type = torch.tensor([1] * num_heads, device=q.device, dtype=torch.int32)
         streaming_info = None
         base_blockmask = attention_mask
         max_seqlen_q_ = seqlen
         max_seqlen_k_ = seqlen_kv
         p_dropout = 0.0
-        if USE_BLOCK_ATTN and BLOCK_ATTN_AVAILABLE:
+
+        if use_block_sparse:
             x = block_sparse_attn_func(
                 q, k, v,
                 cu_seqlens_q, cu_seqlens_k,
@@ -261,42 +300,62 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads
                 q, k, v,
                 mask_id=base_blockmask.to(torch.int8),
                 is_causal=False,
-                tensor_layout="HND"
+                tensor_layout="HND",
             )
             x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
-    elif compatibility_mode:
+        return x
+
+    # Dense attention backends (or fallback when no sparse mask is provided).
+    if compatibility_mode or mode == "sdpa":
         q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
         k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
         v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
         x = F.scaled_dot_product_attention(q, k, v)
-        x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
-    elif FLASH_ATTN_3_AVAILABLE:
+        return rearrange(x, "b n s d -> b s (n d)", n=num_heads)
+
+    if mode == "flash_attention_2":
+        if FLASH_ATTN_2_AVAILABLE:
+            q = rearrange(q, "b s (n d) -> b s n d", n=num_heads)
+            k = rearrange(k, "b s (n d) -> b s n d", n=num_heads)
+            v = rearrange(v, "b s (n d) -> b s n d", n=num_heads)
+            x = flash_attn.flash_attn_func(q, k, v)
+            return rearrange(x, "b s n d -> b s (n d)", n=num_heads)
+        _warn_attention_once(
+            "Requested flash_attention_2, but flash_attn is unavailable; falling back to sdpa."
+        )
+        q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
+        k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
+        v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
+        x = F.scaled_dot_product_attention(q, k, v)
+        return rearrange(x, "b n s d -> b s (n d)", n=num_heads)
+
+    # Default dense fallback path: prefer FlashAttention-3/2, then Sage, then SDPA.
+    if FLASH_ATTN_3_AVAILABLE:
         q = rearrange(q, "b s (n d) -> b s n d", n=num_heads)
         k = rearrange(k, "b s (n d) -> b s n d", n=num_heads)
         v = rearrange(v, "b s (n d) -> b s n d", n=num_heads)
         x = flash_attn_interface.flash_attn_func(q, k, v)
         if isinstance(x, tuple):
             x = x[0]
-        x = rearrange(x, "b s n d -> b s (n d)", n=num_heads)
-    elif FLASH_ATTN_2_AVAILABLE:
+        return rearrange(x, "b s n d -> b s (n d)", n=num_heads)
+    if FLASH_ATTN_2_AVAILABLE:
         q = rearrange(q, "b s (n d) -> b s n d", n=num_heads)
         k = rearrange(k, "b s (n d) -> b s n d", n=num_heads)
         v = rearrange(v, "b s (n d) -> b s n d", n=num_heads)
         x = flash_attn.flash_attn_func(q, k, v)
-        x = rearrange(x, "b s n d -> b s (n d)", n=num_heads)
-    elif SAGE_ATTN_AVAILABLE:
+        return rearrange(x, "b s n d -> b s (n d)", n=num_heads)
+    if SAGE_ATTN_AVAILABLE:
         q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
         k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
         v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
         x = sageattn(q, k, v)
-        x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
-    else:
-        q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
-        k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
-        v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
-        x = F.scaled_dot_product_attention(q, k, v)
-        x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
-    return x
+        return rearrange(x, "b n s d -> b s (n d)", n=num_heads)
+
+    q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
+    k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
+    v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
+    x = F.scaled_dot_product_attention(q, k, v)
+    return rearrange(x, "b n s d -> b s (n d)", n=num_heads)
 
 
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor):
@@ -423,7 +482,14 @@ class SelfAttention(nn.Module):
             self.local_attn_mask_h = h//8
             self.local_attn_mask_w = w//8
             self.local_range = local_range
-        if USE_BLOCK_ATTN and BLOCK_ATTN_AVAILABLE:
+        attn_mode = _resolve_attention_mode()
+        use_block_sparse = attn_mode == "block_sparse_attention" and BLOCK_ATTN_AVAILABLE
+        if attn_mode == "block_sparse_attention" and not BLOCK_ATTN_AVAILABLE:
+            _warn_attention_once(
+                "Requested block_sparse_attention, but block_sparse_attn is unavailable; "
+                "using sparse_sage mask generation."
+            )
+        if use_block_sparse:
             attention_mask = generate_draft_block_mask(B, self.num_heads, seqlen, q_w, k_w, topk=topk, local_attn_mask=self.local_attn_mask)
         else:
             attention_mask = generate_draft_block_mask_sage(B, self.num_heads, seqlen, q_w, k_w, topk=topk, local_attn_mask=self.local_attn_mask)

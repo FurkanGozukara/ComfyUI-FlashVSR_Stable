@@ -589,6 +589,9 @@ def main():
     writer = None
     total_processed = 0
     start_time_glob = 0
+    stream_decode_enabled = (args.mode in {"tiny", "tiny-long"}) and (not args.tiled_dit)
+    if stream_decode_enabled:
+        print("Streaming decode enabled: writing decoded frame groups incrementally for lower peak memory.")
     
     try:
         import time
@@ -616,50 +619,104 @@ def main():
             print(f"Progress: {progress_pct:6.2f}% | Processed: {total_processed}/{total_frames_to_process} | "
                   f"Elapsed: {formatted_elapsed} | ETA: {formatted_eta} | Speed: {speed_fps:.2f} fps")
             
-            # Process the chunk
-            # Note: We pass chunk_size=0 to flashvsr because we are feeding it an explicit chunk
-            # that we want processed fully right now.
-            output_frames = flashvsr(
-                pipe=pipe,
-                frames=frames,
-                scale=args.scale,
-                color_fix=color_fix,
-                tiled_vae=args.tiled_vae,
-                tiled_dit=args.tiled_dit,
-                tile_size=args.tile_size,
-                tile_overlap=args.tile_overlap,
-                unload_dit=args.unload_dit,
-                sparse_ratio=args.sparse_ratio,
-                kv_ratio=args.kv_ratio,
-                local_range=args.local_range,
-                seed=args.seed,
-                force_offload=effective_force_offload,
-                enable_debug=args.enable_debug,
-                chunk_size=0, # Already chunked
-                resize_factor=args.resize_factor,
-                mode=args.mode
-            )
-            
-            # Initialize Writer on first chunk
-            if writer is None:
-                h, w = output_frames.shape[1], output_frames.shape[2]
-                print(f"Output dimensions: {w}x{h}")
-                print(f"Saving output video to: {args.output}")
-                writer = VideoWriter(
-                    output_path=args.output,
-                    fps=output_fps,
-                    width=w,
-                    height=h,
-                    codec=args.codec,
-                    crf=args.crf
+            if stream_decode_enabled:
+                streamed_any = False
+
+                def on_stream_chunk(chunk_frames):
+                    nonlocal writer, streamed_any
+                    if chunk_frames is None:
+                        return
+                    if isinstance(chunk_frames, torch.Tensor) and chunk_frames.shape[0] <= 0:
+                        return
+
+                    if writer is None:
+                        h, w = int(chunk_frames.shape[1]), int(chunk_frames.shape[2])
+                        print(f"Output dimensions: {w}x{h}")
+                        print(f"Saving output video to: {args.output}")
+                        writer = VideoWriter(
+                            output_path=args.output,
+                            fps=output_fps,
+                            width=w,
+                            height=h,
+                            codec=args.codec,
+                            crf=args.crf
+                        )
+
+                    writer.write(chunk_frames)
+                    streamed_any = True
+
+                flashvsr(
+                    pipe=pipe,
+                    frames=frames,
+                    scale=args.scale,
+                    color_fix=color_fix,
+                    tiled_vae=args.tiled_vae,
+                    tiled_dit=args.tiled_dit,
+                    tile_size=args.tile_size,
+                    tile_overlap=args.tile_overlap,
+                    unload_dit=args.unload_dit,
+                    sparse_ratio=args.sparse_ratio,
+                    kv_ratio=args.kv_ratio,
+                    local_range=args.local_range,
+                    seed=args.seed,
+                    force_offload=effective_force_offload,
+                    enable_debug=args.enable_debug,
+                    chunk_size=0, # Already chunked
+                    resize_factor=args.resize_factor,
+                    mode=args.mode,
+                    stream_output_callback=on_stream_chunk,
                 )
-            
-            # Write frames
-            writer.write(output_frames)
+
+                if not streamed_any:
+                    raise RuntimeError("Streaming decode did not produce any output frames.")
+            else:
+                # Process the chunk
+                # Note: We pass chunk_size=0 to flashvsr because we are feeding it an explicit chunk
+                # that we want processed fully right now.
+                output_frames = flashvsr(
+                    pipe=pipe,
+                    frames=frames,
+                    scale=args.scale,
+                    color_fix=color_fix,
+                    tiled_vae=args.tiled_vae,
+                    tiled_dit=args.tiled_dit,
+                    tile_size=args.tile_size,
+                    tile_overlap=args.tile_overlap,
+                    unload_dit=args.unload_dit,
+                    sparse_ratio=args.sparse_ratio,
+                    kv_ratio=args.kv_ratio,
+                    local_range=args.local_range,
+                    seed=args.seed,
+                    force_offload=effective_force_offload,
+                    enable_debug=args.enable_debug,
+                    chunk_size=0, # Already chunked
+                    resize_factor=args.resize_factor,
+                    mode=args.mode
+                )
+
+                # Initialize Writer on first chunk
+                if writer is None:
+                    h, w = output_frames.shape[1], output_frames.shape[2]
+                    print(f"Output dimensions: {w}x{h}")
+                    print(f"Saving output video to: {args.output}")
+                    writer = VideoWriter(
+                        output_path=args.output,
+                        fps=output_fps,
+                        width=w,
+                        height=h,
+                        codec=args.codec,
+                        crf=args.crf
+                    )
+
+                # Write frames
+                writer.write(output_frames)
             total_processed += frames.shape[0]
             
             # Cleanup
-            del frames, output_frames
+            if stream_decode_enabled:
+                del frames
+            else:
+                del frames, output_frames
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()

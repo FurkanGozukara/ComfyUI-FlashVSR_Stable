@@ -1,7 +1,7 @@
 import types
 import os
 import time
-from typing import Optional, Tuple, Literal
+from typing import Callable, Optional, Tuple, Literal
 
 import torch
 import torch.nn as nn
@@ -299,6 +299,87 @@ class FlashVSRTinyPipeline(BasePipeline):
         if not keep_vae:
             self.TCDecoder.to('cpu')
 
+    @staticmethod
+    def _move_cache_tensors(cache_list, device):
+        if cache_list is None:
+            return None
+
+        def _move_item(item):
+            if isinstance(item, torch.Tensor):
+                return item.to(device=device, non_blocking=True)
+            if isinstance(item, list):
+                return [_move_item(v) for v in item]
+            if isinstance(item, tuple):
+                return tuple(_move_item(v) for v in item)
+            return item
+
+        for idx, item in enumerate(cache_list):
+            cache_list[idx] = _move_item(item)
+        return cache_list
+
+    def _offload_dit_before_decode(self):
+        if self.dit is None:
+            return
+
+        try:
+            dit_dev = next(self.dit.parameters()).device
+            if str(dit_dev) != "cpu":
+                self.dit.to("cpu")
+        except Exception:
+            pass
+
+        if hasattr(self.dit, "LQ_proj_in") and self.dit.LQ_proj_in is not None:
+            self.dit.LQ_proj_in.to("cpu")
+        clean_vram()
+
+    def _reload_dit_for_inference(self):
+        if self.dit is None:
+            return
+
+        try:
+            dit_dev = next(self.dit.parameters()).device
+            if str(dit_dev) != str(self.device):
+                self.dit.to(self.device)
+        except Exception:
+            pass
+
+        if hasattr(self.dit, "LQ_proj_in") and self.dit.LQ_proj_in is not None:
+            self.dit.LQ_proj_in.to(self.device)
+
+    @staticmethod
+    def _build_spatial_blend_mask(
+        out_h: int,
+        out_w: int,
+        overlap_h: int,
+        overlap_w: int,
+        fade_top: bool,
+        fade_bottom: bool,
+        fade_left: bool,
+        fade_right: bool,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        overlap_h = max(0, min(overlap_h, out_h // 2))
+        overlap_w = max(0, min(overlap_w, out_w // 2))
+
+        mask_y = torch.ones(out_h, dtype=dtype, device="cpu")
+        mask_x = torch.ones(out_w, dtype=dtype, device="cpu")
+
+        if overlap_h > 0 and fade_top:
+            ramp = torch.linspace(0.0, 1.0, steps=overlap_h + 1, dtype=dtype, device="cpu")[1:]
+            mask_y[:overlap_h] = torch.minimum(mask_y[:overlap_h], ramp)
+        if overlap_h > 0 and fade_bottom:
+            ramp = torch.linspace(1.0, 0.0, steps=overlap_h + 1, dtype=dtype, device="cpu")[:-1]
+            mask_y[-overlap_h:] = torch.minimum(mask_y[-overlap_h:], ramp)
+
+        if overlap_w > 0 and fade_left:
+            ramp = torch.linspace(0.0, 1.0, steps=overlap_w + 1, dtype=dtype, device="cpu")[1:]
+            mask_x[:overlap_w] = torch.minimum(mask_x[:overlap_w], ramp)
+        if overlap_w > 0 and fade_right:
+            ramp = torch.linspace(1.0, 0.0, steps=overlap_w + 1, dtype=dtype, device="cpu")[:-1]
+            mask_x[-overlap_w:] = torch.minimum(mask_x[-overlap_w:], ramp)
+
+        return (mask_y[:, None] * mask_x[None, :]).view(1, 1, 1, out_h, out_w)
+
     @torch.no_grad()
     def __call__(
         self,
@@ -330,6 +411,8 @@ class FlashVSRTinyPipeline(BasePipeline):
         unload_dit = False,
         force_offload = False,
         enable_debug_logging = False,
+        stream_output_callback: Optional[Callable[[torch.Tensor], None]] = None,
+        stream_output_every: int = 1,
     ):
         # 只接受 cfg=1.0（与原代码一致）
         assert cfg_scale == 1.0, "cfg_scale must be 1.0"
@@ -377,7 +460,8 @@ class FlashVSRTinyPipeline(BasePipeline):
         if hasattr(self.dit, "LQ_proj_in"):
             self.dit.LQ_proj_in.clear_cache()
 
-        frames_total = [] # Streaming accumulator
+        stream_output_every = max(1, int(stream_output_every or 1))
+        frames_total = [] if stream_output_callback is None else None
         LQ_pre_idx = 0
         LQ_cur_idx = 0
         self.TCDecoder.clean_mem()
@@ -449,6 +533,11 @@ class FlashVSRTinyPipeline(BasePipeline):
                 # Streaming Decode!
                 cur_LQ_frame = LQ_video[:,:,LQ_pre_idx:LQ_cur_idx,:,:].to(self.device)
 
+                if unload_dit:
+                    pre_cache_k = self._move_cache_tensors(pre_cache_k, "cpu")
+                    pre_cache_v = self._move_cache_tensors(pre_cache_v, "cpu")
+                    self._offload_dit_before_decode()
+
                 if tiled: # tiled_vae logic
                     B, C, T, H, W = cur_latents.shape
 
@@ -514,7 +603,19 @@ class FlashVSRTinyPipeline(BasePipeline):
 
                             out_tile = out_tile.transpose(1, 2).to('cpu')
                             th, tw = out_tile.shape[3], out_tile.shape[4]
-                            mask = torch.ones((1, 1, 1, th, tw), device='cpu')
+                            overlap_h = max(0, (l_tile_h - l_stride_h) * 8)
+                            overlap_w = max(0, (l_tile_w - l_stride_w) * 8)
+                            mask = self._build_spatial_blend_mask(
+                                out_h=th,
+                                out_w=tw,
+                                overlap_h=overlap_h,
+                                overlap_w=overlap_w,
+                                fade_top=(y > 0),
+                                fade_bottom=(y_end < H),
+                                fade_left=(x > 0),
+                                fade_right=(x_end < W),
+                                dtype=out_tile.dtype,
+                            )
                             y_out, x_out = y * 8, x * 8
                             cur_frames[:, :, :, y_out:y_out+th, x_out:x_out+tw] += out_tile * mask
                             weights[:, :, :, y_out:y_out+th, x_out:x_out+tw] += mask
@@ -543,11 +644,20 @@ class FlashVSRTinyPipeline(BasePipeline):
                 except:
                     pass
 
-                frames_total.append(cur_frames)
+                cur_frames_cpu = cur_frames if cur_frames.device.type == "cpu" else cur_frames.to("cpu")
+                if stream_output_callback is not None:
+                    if ((cur_process_idx + 1) % stream_output_every == 0) or (cur_process_idx == process_total_num - 1):
+                        stream_output_callback(cur_frames_cpu)
+                else:
+                    frames_total.append(cur_frames_cpu)
                 LQ_pre_idx = LQ_cur_idx
 
                 if unload_dit:
-                    del noise_pred_posi, cur_frames, cur_latents, cur_LQ_frame
+                    if cur_process_idx < (process_total_num - 1):
+                        self._reload_dit_for_inference()
+                        pre_cache_k = self._move_cache_tensors(pre_cache_k, self.device)
+                        pre_cache_v = self._move_cache_tensors(pre_cache_v, self.device)
+                    del noise_pred_posi, cur_frames, cur_frames_cpu, cur_latents, cur_LQ_frame
                     clean_vram()
 
             if hasattr(self.dit, "LQ_proj_in"):
@@ -557,9 +667,9 @@ class FlashVSRTinyPipeline(BasePipeline):
             if force_offload:
                 self.offload_model()
 
-            frames = torch.cat(frames_total, dim=2)
+            frames = None if stream_output_callback is not None else torch.cat(frames_total, dim=2)
 
-        return frames[0]
+        return None if frames is None else frames[0]
 
 
 # -----------------------------

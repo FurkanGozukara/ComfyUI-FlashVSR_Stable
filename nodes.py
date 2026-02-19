@@ -1020,7 +1020,7 @@ class cqdm:
     def __len__(self):
         return self.total
 
-def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, force_offload, enable_debug, is_single_frame_input=False):
+def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, force_offload, enable_debug, is_single_frame_input=False, stream_output_callback=None):
     """
     Processes a single chunk of frames.
     
@@ -1163,19 +1163,57 @@ def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_siz
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs, enable_debug=enable_debug)
 
-        video = pipe(
+        streaming_supported = (
+            callable(stream_output_callback)
+            and isinstance(pipe, (FlashVSRTinyPipeline, FlashVSRTinyLongPipeline))
+        )
+        streamed_frames = 0
+
+        def _on_stream_chunk(raw_chunk):
+            nonlocal streamed_frames
+            if raw_chunk is None:
+                return
+
+            chunk_video = tensor2video(raw_chunk).to("cpu")
+            chunk_video = chunk_video[:, pad_top:pad_top + sH, pad_left:pad_left + sW, :]
+
+            remaining = frames.shape[0] - streamed_frames
+            if remaining <= 0:
+                return
+            if chunk_video.shape[0] > remaining:
+                chunk_video = chunk_video[:remaining]
+            if chunk_video.shape[0] <= 0:
+                return
+
+            stream_output_callback(chunk_video)
+            streamed_frames += int(chunk_video.shape[0])
+
+        pipe_kwargs = dict(
             prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=seed, tiled=tiled_vae,
             progress_bar_cmd=cqdm_debug, LQ_video=LQ, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
             topk_ratio=sparse_ratio*768*1280/(th*tw), kv_ratio=kv_ratio, local_range=local_range,
-            color_fix = color_fix, unload_dit=unload_dit, force_offload=force_offload,
+            color_fix=color_fix, unload_dit=unload_dit, force_offload=force_offload,
             enable_debug_logging=enable_debug,
             **vae_tiler_kwargs
         )
+        if streaming_supported:
+            pipe_kwargs["stream_output_callback"] = _on_stream_chunk
+            pipe_kwargs["stream_output_every"] = 1
+
+        video = pipe(**pipe_kwargs)
 
         process_end = time.time()
         
         if enable_debug:
             log(f"Inference completed in {process_end - process_start:.2f}s", message_type='info', icon="⏱️")
+
+        if streaming_supported:
+            del video, LQ
+            clean_vram()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            return None
+
         final_output_tensor = tensor2video(video).to('cpu')
         
         # =====================================================================
@@ -1205,7 +1243,7 @@ def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_siz
 
     return final_output[:frames.shape[0], :, :, :]
 
-def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, force_offload, enable_debug=False, chunk_size=0, resize_factor=1.0, mode="full"):
+def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, force_offload, enable_debug=False, chunk_size=0, resize_factor=1.0, mode="full", stream_output_callback=None):
     """
     =============================================================================
     FIX 9 & 10: Unified Processing Pipeline with Pre-Flight Check
@@ -1303,6 +1341,7 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
     # Chunking Logic
     total_frames = frames.shape[0]
     final_outputs = []
+    final_output_tensor = None
 
     is_single_frame_input = (frames.shape[0] == 1)
 
@@ -1331,10 +1370,12 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
                         pipe, chunk_frames, scale, color_fix, current_tiled_vae, current_tiled_dit,
                         tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio,
                         local_range, seed, force_offload, enable_debug,
-                        is_single_frame_input=is_single_frame_input
+                        is_single_frame_input=is_single_frame_input,
+                        stream_output_callback=stream_output_callback,
                     )
-                    final_outputs.append(chunk_out.cpu())
-                    del chunk_out
+                    if chunk_out is not None:
+                        final_outputs.append(chunk_out.cpu())
+                        del chunk_out
                     clean_vram()
                     break # Success
                 except torch.OutOfMemoryError as e:
@@ -1352,7 +1393,8 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
                         log("Both Tiled VAE and DiT enabled but still OOM. Cannot recover.", message_type='error', icon="❌")
                         raise e # Cannot recover further
 
-        final_output_tensor = torch.cat(final_outputs, dim=0)
+        if final_outputs:
+            final_output_tensor = torch.cat(final_outputs, dim=0)
     else:
         # Auto-Fallback Logic for single chunk/full video
         retry_count = 0
@@ -1366,7 +1408,8 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
                     pipe, frames, scale, color_fix, current_tiled_vae, current_tiled_dit,
                     tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio,
                     local_range, seed, force_offload, enable_debug,
-                    is_single_frame_input=is_single_frame_input
+                    is_single_frame_input=is_single_frame_input,
+                    stream_output_callback=stream_output_callback,
                 )
                 break
             except torch.OutOfMemoryError as e:
@@ -1395,7 +1438,8 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
     log("PROCESSING SUMMARY", message_type='finish', icon="📊")
     log(f"Total Processing Time: {total_time:.2f}s ({fps:.2f} FPS)", message_type='info', icon="⏱️")
     log(f"Input Resolution: {input_resolution} ({frames.shape[0]} frames)", message_type='info', icon="📥")
-    log(f"Output Resolution: {output_resolution} ({final_output_tensor.shape[0]} frames)", message_type='info', icon="📤")
+    out_frame_count = final_output_tensor.shape[0] if isinstance(final_output_tensor, torch.Tensor) else frames.shape[0]
+    log(f"Output Resolution: {output_resolution} ({out_frame_count} frames)", message_type='info', icon="📤")
     
     if torch.cuda.is_available():
         peak_memory = torch.cuda.max_memory_reserved() / 1024**3
@@ -1404,6 +1448,8 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
     log_resource_usage(prefix="Final")
     log("=" * 60, message_type='info')
     
+    if stream_output_callback is not None and final_output_tensor is None:
+        return None
     return final_output_tensor
 
 

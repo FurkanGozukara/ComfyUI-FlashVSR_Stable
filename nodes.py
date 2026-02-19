@@ -751,6 +751,25 @@ def calculate_tile_coords(height, width, tile_size, overlap):
             
     return coords
 
+
+def calculate_vae_tiler_kwargs(tile_size_px: int, tile_overlap_px: int, latent_h: int, latent_w: int):
+    """
+    Convert UI tile settings (pixel-space) into VAE tile settings (latent-space).
+    """
+    tile_latent = max(4, int(tile_size_px) // 8)
+    overlap_latent = max(1, int(tile_overlap_px) // 8)
+    stride_latent = max(1, tile_latent - overlap_latent)
+
+    tile_h = max(4, min(tile_latent, int(latent_h)))
+    tile_w = max(4, min(tile_latent, int(latent_w)))
+    stride_h = max(1, min(stride_latent, tile_h))
+    stride_w = max(1, min(stride_latent, tile_w))
+
+    return {
+        "tile_size": (tile_h, tile_w),
+        "tile_stride": (stride_h, stride_w),
+    }
+
 def create_feather_mask(size, overlap):
     H, W = size
     mask = torch.ones(1, 1, H, W)
@@ -1059,12 +1078,22 @@ def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_siz
             if not isinstance(pipe, FlashVSRTinyLongPipeline):
                 LQ_tile = LQ_tile.to(_device)
 
+            vae_tiler_kwargs = {}
+            if tiled_vae:
+                vae_tiler_kwargs = calculate_vae_tiler_kwargs(
+                    tile_size,
+                    tile_overlap,
+                    latent_h=max(1, th // 8),
+                    latent_w=max(1, tw // 8),
+                )
+
             output_tile_gpu = pipe(
                 prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=seed, tiled=tiled_vae,
                 progress_bar_cmd=cqdm_tile, LQ_video=LQ_tile, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
                 topk_ratio=sparse_ratio*768*1280/(th*tw), kv_ratio=kv_ratio, local_range=local_range,
                 color_fix=color_fix, unload_dit=unload_dit, force_offload=force_offload,
-                enable_debug_logging=enable_debug
+                enable_debug_logging=enable_debug,
+                **vae_tiler_kwargs
             )
             
             processed_tile_cpu = tensor2video(output_tile_gpu).to("cpu")
@@ -1116,6 +1145,15 @@ def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_siz
         LQ, th, tw, F, sH, sW, pad_top, pad_left = prepare_input_tensor(_frames, _device, scale=scale, dtype=dtype)
         if not isinstance(pipe, FlashVSRTinyLongPipeline):
             LQ = LQ.to(_device)
+
+        vae_tiler_kwargs = {}
+        if tiled_vae:
+            vae_tiler_kwargs = calculate_vae_tiler_kwargs(
+                tile_size,
+                tile_overlap,
+                latent_h=max(1, th // 8),
+                latent_w=max(1, tw // 8),
+            )
             
         log(f"Processing {frames.shape[0]} frames...", message_type='info', icon="🚀")
         
@@ -1130,7 +1168,8 @@ def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_siz
             progress_bar_cmd=cqdm_debug, LQ_video=LQ, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
             topk_ratio=sparse_ratio*768*1280/(th*tw), kv_ratio=kv_ratio, local_range=local_range,
             color_fix = color_fix, unload_dit=unload_dit, force_offload=force_offload,
-            enable_debug_logging=enable_debug
+            enable_debug_logging=enable_debug,
+            **vae_tiler_kwargs
         )
 
         process_end = time.time()

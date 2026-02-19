@@ -397,24 +397,26 @@ class FlashVSRFullPipeline(BasePipeline):
         self.load_models_to_device(["dit"])
         self.dit.LQ_proj_in.to(self.device)
         
-        # Move TCDecoder to device if available
-        if self.TCDecoder is not None:
+        # TCDecoder is used for non-tiled decode path.
+        if self.TCDecoder is not None and not tiled:
             self.TCDecoder.to(self.device)
 
         # 清理可能存在的 LQ_proj_in cache
         if hasattr(self.dit, "LQ_proj_in"):
             self.dit.LQ_proj_in.clear_cache()
 
-        # Track LQ frame indices (gold standard approach from tiny-long)
+        # Track decode buffers for both paths:
+        # - tiled=True: collect latents and decode once with tiled VAE.
+        # - tiled=False: stream decode with TCDecoder + LQ conditioning.
+        latents_total = []
         frames_total = []
         LQ_pre_idx = 0
         LQ_cur_idx = 0
         
-        # Clean decoder memory if using TCDecoder
-        if self.TCDecoder is not None:
+        # Clean decoder memory for the active decode path.
+        if self.TCDecoder is not None and not tiled:
             self.TCDecoder.clean_mem()
         else:
-            # Fallback to VAE if TCDecoder not loaded
             self.vae.clear_cache()
 
         with torch.no_grad():
@@ -477,7 +479,14 @@ class FlashVSRFullPipeline(BasePipeline):
 
                 # 更新 latent
                 cur_latents = cur_latents - noise_pred_posi
-                
+
+                if tiled:
+                    latents_total.append(cur_latents)
+                    if unload_dit:
+                        del noise_pred_posi, cur_latents
+                        clean_vram()
+                    continue
+
                 # =======================================================================
                 # DECODE: Use TCDecoder with LQ conditioning (like tiny-long)
                 # =======================================================================
@@ -522,16 +531,38 @@ class FlashVSRFullPipeline(BasePipeline):
             if hasattr(self.dit, "LQ_proj_in"):
                 self.dit.LQ_proj_in.clear_cache()
 
-            # Clean up decoder
-            if self.TCDecoder is not None:
-                self.TCDecoder.clean_mem()
-            else:
+            if tiled:
+                if unload_dit and hasattr(self, 'dit') and not next(self.dit.parameters()).is_cpu:
+                    self.offload_model(keep_vae=True)
+                else:
+                    self.load_models_to_device(["vae"])
+
+                latents = torch.cat(latents_total, dim=2)
+                frames = self.decode_video(latents, **tiler_kwargs)
+
+                try:
+                    if color_fix:
+                        frames = self.ColorCorrector(
+                            frames.to(device=LQ_video.device),
+                            LQ_video[:, :, :frames.shape[2], :, :],
+                            clip_range=(-1, 1),
+                            chunk_size=16,
+                            method='adain'
+                        )
+                except:
+                    pass
+
                 self.vae.clear_cache()
-                
+            else:
+                if self.TCDecoder is not None:
+                    self.TCDecoder.clean_mem()
+                else:
+                    self.vae.clear_cache()
+
+                frames = torch.cat(frames_total, dim=2)
+
             if force_offload:
                 self.offload_model()
-
-            frames = torch.cat(frames_total, dim=2)
 
         return frames[0]
 

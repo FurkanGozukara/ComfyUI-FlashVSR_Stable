@@ -464,21 +464,20 @@ class FlashVSRTinyLongPipeline(BasePipeline):
                 if tiled: # tiled_vae
                     B, C, T, H, W = cur_latents.shape
                     
-                    l_tile_h, l_tile_w = tile_size
-                    l_stride_h, l_stride_w = tile_stride
-                    
-                    # Convert pixel-space tile sizes to latent space
-                    # The inputs from the node are typically in pixel space (e.g. 256).
-                    # Latents are H/8.
-                    
-                    # Ensure we are working with ints
-                    if isinstance(l_tile_h, tuple): l_tile_h = l_tile_h[0] # Fallback if tuple passed
-                    if isinstance(l_tile_w, tuple): l_tile_w = l_tile_w[0]
-                    
-                    l_tile_h = max(l_tile_h // 8, 4)
-                    l_tile_w = max(l_tile_w // 8, 4)
-                    l_stride_h = max(l_stride_h // 8, 1)
-                    l_stride_w = max(l_stride_w // 8, 1)
+                    l_tile_h, l_tile_w = int(tile_size[0]), int(tile_size[1])
+                    l_stride_h, l_stride_w = int(tile_stride[0]), int(tile_stride[1])
+
+                    # Accept latent-space tiles (native) and pixel-space tiles (legacy callers).
+                    if l_tile_h > H or l_tile_w > W:
+                        l_tile_h = max(l_tile_h // 8, 4)
+                        l_tile_w = max(l_tile_w // 8, 4)
+                        l_stride_h = max(l_stride_h // 8, 1)
+                        l_stride_w = max(l_stride_w // 8, 1)
+
+                    l_tile_h = max(4, min(l_tile_h, H))
+                    l_tile_w = max(4, min(l_tile_w, W))
+                    l_stride_h = max(1, min(l_stride_h, l_tile_h))
+                    l_stride_w = max(1, min(l_stride_w, l_tile_w))
                     
                     out_H = H * 8
                     out_W = W * 8

@@ -449,6 +449,17 @@ def main():
     force_offload = args.force_offload and not args.no_force_offload
     color_fix = args.color_fix and not args.no_color_fix
     keep_models_on_cpu = args.keep_models_on_cpu and not args.no_keep_models_on_cpu
+    # Offload only if both switches allow it.
+    # This avoids accidental offload-enabled slowdowns when one flag is disabled.
+    effective_force_offload = force_offload and keep_models_on_cpu
+
+    if args.tile_overlap >= args.tile_size:
+        old_overlap = args.tile_overlap
+        args.tile_overlap = max(8, args.tile_size - 8)
+        print(
+            f"Warning: tile_overlap ({old_overlap}) must be smaller than tile_size ({args.tile_size}). "
+            f"Using tile_overlap={args.tile_overlap}."
+        )
 
     print("=" * 60)
     print("FlashVSR CLI - Video Super Resolution")
@@ -457,6 +468,12 @@ def main():
     print(f"Output: {args.output}")
     print(f"Model: {args.model}, Mode: {args.mode}")
     print(f"VAE: {args.vae_model}, Scale: {args.scale}x")
+    print(f"Tiling: tiled_vae={args.tiled_vae}, tiled_dit={args.tiled_dit}, tile_size={args.tile_size}, tile_overlap={args.tile_overlap}")
+    print(
+        "Offload: "
+        f"force_offload={force_offload}, keep_models_on_cpu={keep_models_on_cpu}, "
+        f"effective={effective_force_offload}"
+    )
     print("=" * 60)
 
     # ==========================================================================
@@ -616,7 +633,7 @@ def main():
                 kv_ratio=args.kv_ratio,
                 local_range=args.local_range,
                 seed=args.seed,
-                force_offload=keep_models_on_cpu,  # flashvsr() uses force_offload param for CPU offloading
+                force_offload=effective_force_offload,
                 enable_debug=args.enable_debug,
                 chunk_size=0, # Already chunked
                 resize_factor=args.resize_factor,

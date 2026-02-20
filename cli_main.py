@@ -19,6 +19,10 @@ import argparse
 import os
 import sys
 import gc
+import shutil
+import subprocess
+import threading
+import time
 
 # =============================================================================
 # CLI argument parsing - EXHAUSTIVE mapping from ComfyUI node INPUT_TYPES
@@ -256,6 +260,37 @@ For more information, visit: https://github.com/naxci1/ComfyUI-FlashVSR_Stable
         help='Constant Rate Factor for quality (0-51, lower = better quality). (default: 18)'
     )
     parser.add_argument(
+        '--video_preset',
+        type=str,
+        default='medium',
+        help='FFmpeg preset for output encoding (ultrafast..veryslow). (default: medium)'
+    )
+    parser.add_argument(
+        '--pixel_format',
+        type=str,
+        default='yuv420p',
+        help='FFmpeg pixel format for output encoding. (default: yuv420p)'
+    )
+    parser.add_argument(
+        '--h265_tune',
+        type=str,
+        default='none',
+        help='Optional x265 tune (none, grain, psnr, ssim, fastdecode, zerolatency, animation). (default: none)'
+    )
+    parser.add_argument(
+        '--av1_film_grain',
+        type=int,
+        default=8,
+        help='SVT-AV1 film grain strength (0-50). (default: 8)'
+    )
+    parser.add_argument(
+        '--av1_film_grain_denoise',
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help='SVT-AV1 film-grain-denoise flag (0 or 1). (default: 0)'
+    )
+    parser.add_argument(
         '--start_frame',
         type=int,
         default=0,
@@ -370,33 +405,168 @@ class VideoWriter:
     """
     Incremental video writer.
     """
-    def __init__(self, output_path, fps, width, height, codec='libx264', crf=18):
+    def __init__(
+        self,
+        output_path,
+        fps,
+        width,
+        height,
+        codec='libx264',
+        crf=18,
+        video_preset='medium',
+        pixel_format='yuv420p',
+        h265_tune='none',
+        av1_film_grain=8,
+        av1_film_grain_denoise=False,
+    ):
         import cv2
         self.output_path = output_path
         self.width = width
         self.height = height
-        self.codec = codec
-        self.crf = crf
+        codec_raw = str(codec or 'libx264').strip().lower()
+        codec_map = {
+            'h264': 'libx264',
+            'x264': 'libx264',
+            'libx264': 'libx264',
+            'h265': 'libx265',
+            'x265': 'libx265',
+            'hevc': 'libx265',
+            'libx265': 'libx265',
+            'av1': 'libsvtav1',
+            'libsvtav1': 'libsvtav1',
+            'libaom-av1': 'libaom-av1',
+            'vp9': 'libvpx-vp9',
+            'libvpx-vp9': 'libvpx-vp9',
+        }
+        self.codec = codec_map.get(codec_raw, codec_raw or 'libx264')
+        self.crf = max(0, min(63, int(crf)))
+        self.video_preset = str(video_preset or 'medium').strip().lower() or 'medium'
+        self.pixel_format = str(pixel_format or 'yuv420p').strip().lower() or 'yuv420p'
+        self.h265_tune = str(h265_tune or 'none').strip().lower() or 'none'
+        if self.h265_tune not in {'none', 'grain', 'psnr', 'ssim', 'fastdecode', 'zerolatency', 'animation'}:
+            self.h265_tune = 'none'
+        try:
+            self.av1_film_grain = int(float(av1_film_grain))
+        except Exception:
+            self.av1_film_grain = 8
+        self.av1_film_grain = max(0, min(50, int(self.av1_film_grain)))
+        self.av1_film_grain_denoise = bool(int(av1_film_grain_denoise))
+        self.out = None
+        self.proc = None
+        self._ffmpeg_log_lines = []
+        self._ffmpeg_log_limit = 200
+        self._ffmpeg_log_thread = None
+        self._write_calls = 0
+        self._written_frames = 0
         
         # Ensure output directory exists
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-        
-        # Determine codec fourcc
-        if codec in ['libx264', 'h264']:
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v') # mp4v is safer for general compatibility without ffmpeg specifically
-        elif codec in ['libx265', 'hevc']:
+
+        # Prefer ffmpeg rawvideo piping for full codec/preset/pixfmt/tune support.
+        ffmpeg_bin = shutil.which('ffmpeg')
+        if ffmpeg_bin:
+            ffmpeg_cmd = [
+                ffmpeg_bin,
+                '-hide_banner',
+                '-nostats',
+                '-loglevel',
+                'warning',
+                '-y',
+                '-f',
+                'rawvideo',
+                '-pix_fmt',
+                'rgb24',
+                '-s',
+                f'{width}x{height}',
+                '-r',
+                str(float(fps)),
+                '-i',
+                '-',
+                '-an',
+                '-c:v',
+                self.codec,
+                '-preset',
+                self.video_preset,
+                '-crf',
+                str(self.crf),
+                '-pix_fmt',
+                self.pixel_format,
+            ]
+            if self.codec == 'libx265' and self.h265_tune != 'none':
+                ffmpeg_cmd.extend(['-tune', self.h265_tune])
+            if self.codec in {'libsvtav1', 'libaom-av1'}:
+                ffmpeg_cmd.extend([
+                    '-svtav1-params',
+                    f'film-grain={self.av1_film_grain}:film-grain-denoise={1 if self.av1_film_grain_denoise else 0}',
+                ])
+            ffmpeg_cmd.append(output_path)
+            try:
+                self.proc = subprocess.Popen(
+                    ffmpeg_cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                )
+                self._start_ffmpeg_log_reader()
+                print(
+                    f"[VideoWriter] ffmpeg encoder started: codec={self.codec}, "
+                    f"crf={self.crf}, preset={self.video_preset}, pix_fmt={self.pixel_format}"
+                )
+                return
+            except Exception as e:
+                print(f"Warning: ffmpeg writer init failed ({e}). Falling back to OpenCV writer.")
+
+        # Fallback: OpenCV writer (limited codec support).
+        if self.codec in ['libx265', 'hevc', 'h265', 'x265']:
             fourcc = cv2.VideoWriter_fourcc(*'hvc1')
         else:
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            
+
         self.out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-        
+
         if not self.out.isOpened():
-             print("Warning: cv2.VideoWriter failed to open with default flags. Trying 'mp4v'.")
-             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-             self.out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-             if not self.out.isOpened():
+            print("Warning: cv2.VideoWriter failed to open with default flags. Trying 'mp4v'.")
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            self.out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+            if not self.out.isOpened():
                 raise RuntimeError(f"Failed to create output video: {output_path}")
+        else:
+            print("[VideoWriter] using OpenCV fallback writer")
+
+    def _record_ffmpeg_log(self, line):
+        msg = str(line or "").strip()
+        if not msg:
+            return
+        self._ffmpeg_log_lines.append(msg)
+        if len(self._ffmpeg_log_lines) > self._ffmpeg_log_limit:
+            self._ffmpeg_log_lines = self._ffmpeg_log_lines[-self._ffmpeg_log_limit:]
+        print(f"[VideoWriter][ffmpeg] {msg}")
+
+    def _start_ffmpeg_log_reader(self):
+        if self.proc is None or self.proc.stderr is None:
+            return
+
+        def _reader():
+            try:
+                while True:
+                    raw = self.proc.stderr.readline()
+                    if not raw:
+                        break
+                    try:
+                        text = raw.decode('utf-8', errors='ignore')
+                    except Exception:
+                        text = str(raw)
+                    self._record_ffmpeg_log(text)
+            except Exception as e:
+                self._record_ffmpeg_log(f"log reader error: {e}")
+
+        self._ffmpeg_log_thread = threading.Thread(target=_reader, daemon=True)
+        self._ffmpeg_log_thread.start()
+
+    def _ffmpeg_tail_text(self, max_lines=12):
+        if not self._ffmpeg_log_lines:
+            return ""
+        return " | ".join(self._ffmpeg_log_lines[-max_lines:])
 
     def write(self, frames_tensor):
         import torch
@@ -415,14 +585,84 @@ class VideoWriter:
         
         n_frames = frames_np.shape[0]
         
+        if self.proc is not None:
+            if self.proc.poll() is not None:
+                tail = self._ffmpeg_tail_text()
+                raise RuntimeError(f"ffmpeg writer process terminated unexpectedly. {tail}")
+            self._write_calls += 1
+            batch_id = self._write_calls
+            batch_start = time.time()
+            print(
+                f"[VideoWriter] write start: batch={batch_id}, frames={n_frames}, "
+                f"total_before={self._written_frames}"
+            )
+            for i in range(n_frames):
+                try:
+                    self.proc.stdin.write(frames_np[i].tobytes())
+                except BrokenPipeError:
+                    tail = self._ffmpeg_tail_text()
+                    raise RuntimeError(
+                        f"ffmpeg stdin closed while writing batch {batch_id} "
+                        f"frame {i + 1}/{n_frames}. {tail}"
+                    )
+                self._written_frames += 1
+                if (i + 1) == n_frames or ((i + 1) % 10 == 0):
+                    print(
+                        f"[VideoWriter] write progress: batch={batch_id}, frame={i + 1}/{n_frames}, "
+                        f"total_written={self._written_frames}"
+                    )
+            try:
+                self.proc.stdin.flush()
+            except Exception:
+                pass
+            print(
+                f"[VideoWriter] write done: batch={batch_id}, frames={n_frames}, "
+                f"elapsed={time.time() - batch_start:.2f}s"
+            )
+            return
+
+        if self.out is None:
+            raise RuntimeError("Video writer is not initialized.")
+
         for i in range(n_frames):
             # Convert RGB to BGR for OpenCV
             frame_bgr = cv2.cvtColor(frames_np[i], cv2.COLOR_RGB2BGR)
             self.out.write(frame_bgr)
             
     def release(self):
+        if self.proc is not None:
+            print("[VideoWriter] finalize: closing ffmpeg stdin")
+            try:
+                if self.proc.stdin:
+                    self.proc.stdin.close()
+            except Exception:
+                pass
+            wait_start = time.time()
+            while True:
+                if self.proc.poll() is not None:
+                    break
+                waited = time.time() - wait_start
+                print(f"[VideoWriter] finalize: waiting for ffmpeg exit ({waited:.1f}s)")
+                try:
+                    self.proc.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    continue
+            ret = self.proc.returncode if self.proc.returncode is not None else -1
+            if self._ffmpeg_log_thread is not None:
+                self._ffmpeg_log_thread.join(timeout=1.0)
+            print(
+                f"[VideoWriter] finalize: ffmpeg exited code={ret}, "
+                f"total_written_frames={self._written_frames}"
+            )
+            self.proc = None
+            if ret != 0:
+                tail = self._ffmpeg_tail_text()
+                raise RuntimeError(f"FFmpeg encoding failed (code={ret}). {tail}")
+
         if self.out:
+            print("[VideoWriter] finalize: releasing OpenCV writer")
             self.out.release()
+            self.out = None
 
 def format_time(seconds):
     """
@@ -439,6 +679,32 @@ def format_time(seconds):
 
 def main():
     args = parse_args()
+
+    args.video_preset = str(args.video_preset or 'medium').strip().lower() or 'medium'
+    valid_presets = {
+        'ultrafast',
+        'superfast',
+        'veryfast',
+        'faster',
+        'fast',
+        'medium',
+        'slow',
+        'slower',
+        'veryslow',
+    }
+    if args.video_preset not in valid_presets:
+        args.video_preset = 'medium'
+
+    args.pixel_format = str(args.pixel_format or 'yuv420p').strip().lower() or 'yuv420p'
+    args.h265_tune = str(args.h265_tune or 'none').strip().lower() or 'none'
+    if args.h265_tune not in {'none', 'grain', 'psnr', 'ssim', 'fastdecode', 'zerolatency', 'animation'}:
+        args.h265_tune = 'none'
+    try:
+        args.av1_film_grain = int(args.av1_film_grain)
+    except Exception:
+        args.av1_film_grain = 8
+    args.av1_film_grain = max(0, min(50, int(args.av1_film_grain)))
+    args.av1_film_grain_denoise = bool(int(args.av1_film_grain_denoise))
 
     # Safety check: ensure output file does not already exist
     if os.path.exists(args.output):
@@ -469,6 +735,12 @@ def main():
     print(f"Model: {args.model}, Mode: {args.mode}")
     print(f"VAE: {args.vae_model}, Scale: {args.scale}x")
     print(f"Tiling: tiled_vae={args.tiled_vae}, tiled_dit={args.tiled_dit}, tile_size={args.tile_size}, tile_overlap={args.tile_overlap}")
+    print(
+        "Encoder: "
+        f"codec={args.codec}, crf={args.crf}, preset={args.video_preset}, "
+        f"pix_fmt={args.pixel_format}, h265_tune={args.h265_tune}, "
+        f"av1_film_grain={args.av1_film_grain}, av1_film_grain_denoise={int(args.av1_film_grain_denoise)}"
+    )
     print(
         "Offload: "
         f"force_offload={force_offload}, keep_models_on_cpu={keep_models_on_cpu}, "
@@ -598,6 +870,9 @@ def main():
         start_time_glob = time.time()
         
         for chunk_idx, frames in enumerate(reader):
+            chunk_no = int(chunk_idx) + 1
+            chunk_frames_in = int(frames.shape[0]) if hasattr(frames, "shape") else -1
+            print(f"[Chunk {chunk_no}] inference start: input_frames={chunk_frames_in}")
             # Calculate progress metrics
             elapsed = time.time() - start_time_glob
             
@@ -639,7 +914,12 @@ def main():
                             width=w,
                             height=h,
                             codec=args.codec,
-                            crf=args.crf
+                            crf=args.crf,
+                            video_preset=args.video_preset,
+                            pixel_format=args.pixel_format,
+                            h265_tune=args.h265_tune,
+                            av1_film_grain=args.av1_film_grain,
+                            av1_film_grain_denoise=args.av1_film_grain_denoise,
                         )
 
                     writer.write(chunk_frames)
@@ -669,6 +949,7 @@ def main():
 
                 if not streamed_any:
                     raise RuntimeError("Streaming decode did not produce any output frames.")
+                print(f"[Chunk {chunk_no}] inference done (streaming mode)")
             else:
                 # Process the chunk
                 # Note: We pass chunk_size=0 to flashvsr because we are feeding it an explicit chunk
@@ -693,6 +974,9 @@ def main():
                     resize_factor=args.resize_factor,
                     mode=args.mode
                 )
+                print(
+                    f"[Chunk {chunk_no}] inference done: output_frames={int(output_frames.shape[0])}"
+                )
 
                 # Initialize Writer on first chunk
                 if writer is None:
@@ -705,11 +989,18 @@ def main():
                         width=w,
                         height=h,
                         codec=args.codec,
-                        crf=args.crf
+                        crf=args.crf,
+                        video_preset=args.video_preset,
+                        pixel_format=args.pixel_format,
+                        h265_tune=args.h265_tune,
+                        av1_film_grain=args.av1_film_grain,
+                        av1_film_grain_denoise=args.av1_film_grain_denoise,
                     )
 
                 # Write frames
+                print(f"[Chunk {chunk_no}] write start")
                 writer.write(output_frames)
+                print(f"[Chunk {chunk_no}] write done")
             total_processed += frames.shape[0]
             
             # Cleanup
@@ -729,7 +1020,9 @@ def main():
         traceback.print_exc()
     finally:
         if writer:
+            print("[VideoWriter] finalize begin")
             writer.release()
+            print("[VideoWriter] finalize done")
     
     # ==========================================================================
     # Cleanup

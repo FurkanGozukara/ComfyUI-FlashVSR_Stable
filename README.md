@@ -1,377 +1,130 @@
-# ComfyUI-FlashVSR_Stable
-
-**High-performance Video Super Resolution for ComfyUI with VRAM optimization.**
-
-Run FlashVSR on 8GB-24GB+ GPUs without artifacts. Features intelligent resource management, 5 VAE options, and auto-downloading models.
-
-[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![ComfyUI](https://img.shields.io/badge/ComfyUI-Compatible-green.svg)](https://github.com/comfyanonymous/ComfyUI)
-
----
-
-Registry Link: https://registry.comfy.org/publishers/naxci1/nodes/ComfyUI-FlashVSR_Stable
-
----
-
-## ✨ Key Features
-
-- **🎬 Video Super Resolution**: 2x or 4x upscaling using FlashVSR diffusion models
-- **🧠 5 VAE Options**: Choose from Wan2.1, Wan2.2, LightVAE, TAE variants for optimal VRAM/quality trade-off
-- **📊 Pre-Flight Resource Check**: Intelligent VRAM estimation with settings recommendations
-- **⚡ Auto-Download**: Models download automatically from HuggingFace if missing
-- **🛡️ OOM Protection**: Automatic recovery with progressive fallback (tiled VAE → tiled DiT → chunking)
-- **🔧 Unified Pipeline**: All modes share optimized processing logic
-
----
-
-## 📋 Quick Links
-
-- [Changelog](CHANGELOG.md) - Full version history
-- [Sample Workflow](./workflow/FlashVSR.json)
-- [HuggingFace Models](https://huggingface.co/JunhaoZhuang/FlashVSR-v1.1)
-
----
-
-## Performance & VRAM Optimization
-
-This node is optimized for various hardware configurations. Here are some guidelines:
-
-### VRAM Tiers & Settings
-
-| VRAM | Mode | Tiling | Chunk Size | Precision | Notes |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **24GB+** | `full` or `tiny` | Disabled | 0 (All) | `bf16`/`auto` | Max quality/speed. |
-| **16GB** | `tiny` | `tiled_vae=True` | 0 or ~100 | `bf16`/`auto` | Enable `keep_models_on_cpu`. |
-| **12GB** | `tiny` | `tiled_vae=True`, `tiled_dit=True` | ~50 | `fp16` | Use `sparse_sage` attention. |
-| **8GB** | `tiny-long` | **Required** | ~20 | `fp16` | Must use tiling and chunking. |
-
-### Performance Enhancements
-- **Attention Mode**: Use `sparse_sage_attention` for the best balance of speed and memory. `flash_attention_2` is faster but requires specific hardware/installation.
-- **Precision**: `bf16` (BFloat16) is recommended for RTX 3000/4000/5000 series. It is faster and preserves dynamic range better than `fp16`.
-- **Chunking**: Use `frame_chunk_size` to process videos in segments. This moves processed frames to CPU RAM, preventing VRAM saturation on long clips.
-- **Resize Input**: If the input video is large (e.g., 1080p), use the `resize_factor` parameter to reduce input size to `0.5x` before processing. This drastically reduces VRAM usage and allows for 4x upscaling of the resized result (net 2x output). For small videos, leave at `1.0`.
-
-### Pre-Flight Resource Check (NEW)
-
-Before processing, FlashVSR now performs an intelligent pre-flight check that:
-
-1. **Estimates VRAM Requirements**: Calculates approximate VRAM needed based on resolution, frames, scale, and settings.
-2. **Checks Available Resources**: Uses `torch.cuda.mem_get_info()` for accurate real-time VRAM availability.
-3. **Provides Recommendations**: If OOM is predicted, suggests optimal settings.
-
-Example console output:
-```
-============================================================
-🔍 PRE-FLIGHT RESOURCE CHECK
-💻 RAM: 15.4GB / 95.8GB
-💾 VRAM Available: 14.2GB
-📊 Estimated VRAM Required: 12.8GB
-✅ Safe to proceed. Estimated ~12.8GB needed, 14.2GB available.
-============================================================
-```
-
-If VRAM is insufficient:
-```
-⚠️ Current settings require ~18.5GB but only 8.0GB available.
-💡 Recommended Optimal Settings:
-  • chunk_size = 32
-  • tiled_vae = True
-  • tiled_dit = True
-  • resize_factor = 0.6
-```
-
----
-
-## 🎨 VAE Model Selection
-
-### VAE Type Comparison
-
-| VAE Type | VRAM Usage | Speed | Quality | Best For |
-| :--- | :--- | :--- | :--- | :--- |
-| **Wan2.1** | 8-12 GB | Baseline | ⭐⭐⭐⭐⭐ | Maximum quality, 24GB+ VRAM |
-| **Wan2.2** | 8-12 GB | Baseline | ⭐⭐⭐⭐⭐ | Improved normalization for Wan2.2 models |
-| **LightVAE_W2.1** | 4-5 GB | 2-3x faster | ⭐⭐⭐⭐ | 8-16GB VRAM, speed priority |
-| **TAE_W2.2** | 6-8 GB | 1.5x faster | ⭐⭐⭐⭐ | Temporal consistency priority |
-| **LightTAE_HY1.5** | 3-4 GB | 3x faster | ⭐⭐⭐⭐ | HunyuanVideo compatible, minimum VRAM |
-
-### VAE Selection Guide
-
-| Your VRAM | Recommended VAE | Additional Settings |
-| :--- | :--- | :--- |
-| **8GB** | `LightTAE_HY1.5` or `LightVAE_W2.1` | `tiled_vae=True`, `tiled_dit=True`, `chunk_size=16` |
-| **12GB** | `LightVAE_W2.1` or `Wan2.1` | `tiled_vae=True` |
-| **16GB** | Any VAE | Optional tiling for long videos |
-| **24GB+** | `Wan2.1` or `Wan2.2` | Maximum quality, no restrictions |
-
-### Auto-Download
-
-All VAE models auto-download from HuggingFace if not found locally:
-
-| VAE Selection | File | Direct Download Link |
-| :--- | :--- | :--- |
-| **Wan2.1** | `Wan2.1_VAE.pth` | [Download](https://huggingface.co/lightx2v/Autoencoders/blob/main/Wan2.1_VAE.pth) |
-| **Wan2.2** | `Wan2.2_VAE.pth` | [Download](https://huggingface.co/lightx2v/Autoencoders/blob/main/Wan2.2_VAE.pth) |
-| **LightVAE_W2.1** | `lightvaew2_1.pth` | [Download](https://huggingface.co/lightx2v/Autoencoders/blob/main/lightvaew2_1.pth) |
-| **TAE_W2.2** | `taew2_2.safetensors` | [Download](https://huggingface.co/lightx2v/Autoencoders/blob/main/taew2_2.safetensors) |
-| **LightTAE_HY1.5** | `lighttaehy1_5.pth` | [Download](https://huggingface.co/lightx2v/Autoencoders/blob/main/lighttaehy1_5.pth) |
-
----
-
-## 📖 Best Practices / Settings Guide
-
-### Low VRAM (8-12GB) Configuration
-
-```
-Mode: tiny-long
-VAE: LightVAE_W2.1 or LightTAE_HY1.5
-Tiled VAE: ✅ Enabled
-Tiled DiT: ✅ Enabled
-Chunk Size: 16-32
-Resize Factor: 0.5-0.8
-Keep Models on CPU: ✅ Enabled
-```
-
-### Medium VRAM (16GB) Configuration
-
-```
-Mode: tiny
-VAE: Wan2.1 or LightVAE_W2.1
-Tiled VAE: ✅ Enabled
-Tiled DiT: Optional
-Chunk Size: 50-100
-Resize Factor: 1.0
-Keep Models on CPU: Optional
-```
-
-### High VRAM (24GB+) Configuration
-
-```
-Mode: full or tiny
-VAE: Wan2.1 or Wan2.2
-Tiled VAE: ❌ Disabled
-Tiled DiT: ❌ Disabled
-Chunk Size: 0 (all frames)
-Resize Factor: 1.0
-Keep Models on CPU: ❌ Disabled
-```
-
-### Processing Summary
-
-At the end of each run, you'll see a summary:
-
-```
-============================================================
-📊 PROCESSING SUMMARY
-⏱️ Total Processing Time: 130.08s (1.54 FPS)
-📥 Input Resolution: 276x206 (200 frames)
-📤 Output Resolution: 552x412 (200 frames)
-📈 Peak VRAM Used: 12.4 GB
-============================================================
-```
-
----
-
-## 🔧 Node Parameters
-
-Hover over any input in ComfyUI to see tooltips. Full parameter list:
-
-| Parameter | Description |
-| :--- | :--- |
-| **model** | FlashVSR model version |
-| **mode** | `tiny` (fast), `tiny-long` (lowest VRAM), `full` (highest quality) |
-| **vae_model** | VAE architecture (5 options, auto-download) |
-| **scale** | Upscaling factor: 2x or 4x |
-| **color_fix** | Wavelet color transfer. Highly recommended. |
-| **tiled_vae** | Spatial tiling for VAE. Reduces VRAM, slower. |
-| **tiled_dit** | Spatial tiling for DiT. Required for 4K output. |
-| **tile_size** | Tile dimensions. Smaller = less VRAM. |
-| **overlap** | Tile overlap for seamless blending. |
-| **unload_dit** | Unload DiT before VAE decode. |
-| **frame_chunk_size** | Process N frames at a time. 0 = all. |
-| **enable_debug** | Verbose console logging. |
-| **keep_models_on_cpu** | Offload to system RAM when idle. |
-| **resize_factor** | To first reduce the size of large videos and then enlarge them, use a range of (0.3-1.0). |
-| **attention_mode** | Attention kernel: `sparse_sage`, `flash_attention_2`, `sdpa`, `block_sparse` |
-
----
-
-## 💻 Command-Line Interface (CLI)
-
-FlashVSR includes a full-featured CLI that mirrors all ComfyUI node parameters for standalone video upscaling.
-
-### Quick Start
-
-```bash
-# Basic 2x upscale
-python cli_main.py --input video.mp4 --output upscaled.mp4 --scale 2
-
-# 4x upscale with tiling for lower VRAM
-python cli_main.py --input video.mp4 --output upscaled.mp4 --scale 4 \
-    --tiled_vae --tiled_dit --tile_size 256 --tile_overlap 24
-
-# Long video with chunking to prevent OOM
-python cli_main.py --input long_video.mp4 --output upscaled.mp4 \
-    --frame_chunk_size 50 --mode tiny-long
-
-# Low VRAM mode (8GB GPUs)
-python cli_main.py --input video.mp4 --output upscaled.mp4 --scale 2 \
-    --vae_model LightVAE_W2.1 --tiled_vae --tiled_dit \
-    --frame_chunk_size 20 --resize_factor 0.5
-
-# Custom models directory
-python cli_main.py --input video.mp4 --output upscaled.mp4 \
-    --models_dir /path/to/your/models
-```
-
-### CLI Arguments Reference
-
-All arguments map 1:1 with ComfyUI node inputs. Run `python cli_main.py --help` for full details.
-
-#### Required Arguments
-
-| Argument | Description |
-| :--- | :--- |
-| `--input`, `-i` | Input video file path (e.g., `video.mp4`) |
-| `--output`, `-o` | Output video file path (e.g., `upscaled.mp4`) |
-
-#### Pipeline Initialization (from FlashVSRNodeInitPipe)
-
-| Argument | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `--model` | choice | `FlashVSR-v1.1` | Model version: `FlashVSR`, `FlashVSR-v1.1` |
-| `--mode` | choice | `tiny` | Operation mode: `tiny`, `tiny-long`, `full` |
-| `--vae_model` | choice | `Wan2.1` | VAE model: `Wan2.1`, `Wan2.2`, `LightVAE_W2.1`, `TAE_W2.2`, `LightTAE_HY1.5` |
-| `--force_offload` | flag | `True` | Force offload models to CPU after execution |
-| `--no_force_offload` | flag | - | Disable force offloading |
-| `--precision` | choice | `auto` | Precision: `fp16`, `bf16`, `auto` |
-| `--device` | string | `auto` | Device: `cuda:0`, `cuda:1`, `cpu`, `auto` |
-| `--attention_mode` | choice | `sparse_sage_attention` | Attention: `sparse_sage_attention`, `block_sparse_attention`, `flash_attention_2`, `sdpa` |
-
-#### Processing Parameters (from FlashVSRNodeAdv)
-
-| Argument | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `--scale` | int | `2` | Upscaling factor: `2` or `4` |
-| `--color_fix` | flag | `True` | Apply wavelet-based color correction |
-| `--no_color_fix` | flag | - | Disable color correction |
-| `--tiled_vae` | flag | `False` | Enable spatial tiling for VAE decoder |
-| `--tiled_dit` | flag | `False` | Enable spatial tiling for DiT |
-| `--tile_size` | int | `256` | Tile size for DiT processing (32-1024) |
-| `--tile_overlap` | int | `24` | Overlap pixels between tiles (8-512) |
-| `--unload_dit` | flag | `False` | Unload DiT before VAE decoding |
-| `--sparse_ratio` | float | `2.0` | Sparse attention control (1.5-2.0) |
-| `--kv_ratio` | float | `3.0` | Key/Value cache ratio (1.0-3.0) |
-| `--local_range` | int | `11` | Local attention window: `9` or `11` |
-| `--seed` | int | `0` | Random seed for reproducibility |
-| `--frame_chunk_size` | int | `0` | Process N frames at a time (0 = all) |
-| `--enable_debug` | flag | `False` | Enable verbose logging |
-| `--keep_models_on_cpu` | flag | `True` | Keep models in CPU RAM when idle |
-| `--no_keep_models_on_cpu` | flag | - | Keep models in VRAM |
-| `--resize_factor` | float | `1.0` | Resize input before processing (0.1-1.0) |
-
-#### Video I/O Parameters
-
-| Argument | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `--fps` | float | input FPS | Output video FPS |
-| `--codec` | string | `libx264` | Video codec: `libx264`, `libx265`, `h264_nvenc` |
-| `--crf` | int | `18` | Quality (0-51, lower = better) |
-| `--start_frame` | int | `0` | Start frame index (0-indexed) |
-| `--end_frame` | int | `-1` | End frame index (-1 = all frames) |
-| `--models_dir` | string | `./models` | Custom models directory path |
-
----
-
-## 🚀 Installation
-
-### Step 1: Install the Node
-
-```bash
-cd ComfyUI/custom_nodes
-git clone https://github.com/naxci1/ComfyUI-FlashVSR_Stable.git
-python -m pip install -r ComfyUI-FlashVSR_Stable/requirements.txt
-```
-
-> 📢 **Turing architecture or older GPUs (GTX 16 series, RTX 20 series, and earlier)**: Install `triton<3.3.0`:
-> ```bash
-> # Windows
-> python -m pip install -U triton-windows<3.3.0
-> # Linux
-> python -m pip install -U triton<3.3.0
-> ```
-
-### Step 2: Download Models
-
-Download the `FlashVSR` folder from [HuggingFace](https://huggingface.co/JunhaoZhuang/FlashVSR-v1.1):
-
-```
-ComfyUI/models/FlashVSR/
-├── LQ_proj_in.ckpt
-├── TCDecoder.ckpt
-├── diffusion_pytorch_model_streaming_dmd.safetensors
-└── Wan2.1_VAE.pth  (or auto-downloads)
-```
-
-> 💡 **VAE files auto-download** from HuggingFace if not present. Only the DiT model and other components need manual download.
-
-### Step 3: Custom Model Paths (Optional)
-
-By default, FlashVSR looks for models in `ComfyUI/models/FlashVSR/`. To use a different location (e.g., models on another drive):
-
-1. Edit `model_paths.yaml` in the `ComfyUI-FlashVSR_Stable` directory
-2. Set `flashvsr_model_path` to your custom path
-3. Restart ComfyUI
-
-**Example configurations:**
-
-```yaml
-# Windows (D: drive)
-flashvsr_model_path: "D:/AI/Models/FlashVSR"
-
-# Windows (alternative syntax)
-flashvsr_model_path: "E:\\ComfyUI\\models\\FlashVSR"
-
-# Linux/Mac
-flashvsr_model_path: "/home/user/models/FlashVSR"
-flashvsr_model_path: "/mnt/storage/AI/FlashVSR"
-
-# Use default (leave empty)
-flashvsr_model_path: ""
-```
-
-> 📂 **Auto-Download Support**: If model files don't exist, they will automatically download to the directory specified in `model_paths.yaml`. The custom path will be created if needed.
-> 
-> **Example**: If you set `flashvsr_model_path: "D:/AI/Models"`, models will automatically download to `D:/AI/Models/FlashVSR/` on first use.
-
----
-
-## 🖼️ Preview
-
-![Workflow Preview](./workflow/image1.png)
-
-### Sample Workflow
-
-[Download Workflow JSON](./workflow/FlashVSR.json)
-
----
-
-## 🏷️ Recent Changes
-
-See [CHANGELOG.md](CHANGELOG.md) for full version history.
-
----
-
-## 🙏 Acknowledgments
-
-- [FlashVSR](https://github.com/OpenImagingLab/FlashVSR) @OpenImagingLab  
-- [Sparse_SageAttention](https://github.com/jt-zhang/Sparse_SageAttention_API) @jt-zhang
-- [ComfyUI](https://github.com/comfyanonymous/ComfyUI) @comfyanonymous
-- [Wan2.2](https://github.com/Wan-Video/Wan2.2) @Wan-Video
-- [LightX2V](https://github.com/ModelTC/LightX2V) @ModelTC
-- [LightX2V Autoencoders](https://huggingface.co/lightx2v/Autoencoders) @lightx2v
-
----
-
-## 📄 License
-
-MIT License - see [LICENSE](LICENSE) for details.
+# Made for SECourses Premium Members : https://www.patreon.com/posts/150202809
+
+## Download Link : https://www.patreon.com/posts/150202809
+
+## 4K NEWER TUTORIAL : https://youtu.be/_WT4C78j5-c
+
+[![Watch the video](https://img.youtube.com/vi/_WT4C78j5-c/maxresdefault.jpg)](https://youtu.be/_WT4C78j5-c)
+
+## 4K HD Tutorial : https://www.youtube.com/watch?v=bPWsg8DREiM
+
+### SECourses Ultimate Video and Image Upscaler Pro - SeedVR2 - FlashVSR+ - Face Restoration - Gan Upscalers - Queue System - Fully Automated Movie Restoration and Upscale Studio
+
+#### It has been long waited to have a studio level video and image upscaler app. Today we have publishing the version 1.0 of SECourses Ultimate Video and Image Upscaler Pro. It is supporting SeedVR2, FlashVSR+, Gan based upscalers, RIFE frame interpolation, full queue system, full batch folder processing, scene / chunked based processing and many more. It is fully working on every cloud and consumer GPUs like RTX 2000, 3000, 4000, 5000 series and H100, H200, B200, RTX PRO 6000. We are installing app with latest Torch and CUDA versions atm all fully automatic with pre-compiled libraries. Even Torch compile is fully and automatically working.
+
+#### Download Link : https://www.patreon.com/posts/150202809
+
+Here are the links sorted in numerical order:
+
+![1](https://github.com/user-attachments/assets/23c996d4-4fb5-4fda-adae-11feed4980d9)
+![02](https://github.com/user-attachments/assets/07a0c8de-c9c7-4d08-9fbf-0326b24987c4)
+![2](https://github.com/user-attachments/assets/d4264f4a-fd27-40be-9830-6e519aa26e2a)
+![3](https://github.com/user-attachments/assets/1b7332a2-fabd-45df-87a1-79be418a6b44)
+![4](https://github.com/user-attachments/assets/f0881a38-34ee-47fe-8b52-fae93b90059e)
+![5](https://github.com/user-attachments/assets/059c42bc-7331-4202-ad24-aeb1b4de52df)
+![6](https://github.com/user-attachments/assets/a2549ec5-e887-4d50-b60e-4270f45f378a)
+![7](https://github.com/user-attachments/assets/8ed131ca-941c-4843-aefa-7c08d90a4bdb)
+![8](https://github.com/user-attachments/assets/f9b7d639-b8db-42bb-898d-62cb4323fca8)
+![9](https://github.com/user-attachments/assets/de690274-ea08-4564-bf13-31270923ea6d)
+![10](https://github.com/user-attachments/assets/f8bbfa0a-ff36-4734-9da7-3d45e625f746)
+![11](https://github.com/user-attachments/assets/ae196c0a-0421-496c-94e5-262364f4db82)
+![12](https://github.com/user-attachments/assets/1cf4af56-f66c-43c8-8f1e-1c607983112e)
+![13](https://github.com/user-attachments/assets/3574dde3-dc5d-4307-ba19-40e1ec71e0fd)
+
+## Tier 1: Core Product Features (Most Important)
+
+  - Multi-pipeline app with dedicated tabs for SeedVR2, GAN, RIFE, FlashVSR+, Face Restoration, Resolution/Scene Split,
+Output/Comparison, Queue, and Health.
+- SeedVR2 upscaling for video, single image, and frame-folder inputs.
+- SeedVR2 first-frame preview mode.
+- SeedVR2 model selection with metadata-aware defaults and constraints.
+- SeedVR2 advanced memory/performance controls: offloading, BlockSwap, VAE tiling, compile options, attention backend
+selection, model caching toggles.
+- GAN upscaling pipeline for images, videos, and frame-sequence folders.
+- GAN model metadata system (Real-ESRGAN + Open Model Database + spandrel-based detection fallback).
+- RIFE interpolation pipeline with model selection, multiplier/target FPS modes, spatial scale, precision controls,
+static-frame skip, recursion depth.
+- FlashVSR+ diffusion upscaling pipeline with version/mode/scale selection and VRAM-aware modes.
+- FlashVSR memory controls: VAE/DiT tiling, tile size/overlap, unload DiT before decode.
+- Face Restoration as both standalone processor and integrated post-processing across pipelines.
+- Global face restoration enable + global strength control from Global Settings.
+- Unified cross-model resolution strategy: Upscale-x, max-edge cap, and pre-downscale-then-upscale behavior.
+
+##  Tier 2: Output, Encoding, and Comparison
+
+  - Output format controls: auto/mp4/png and PNG-sequence toggles.
+- Video encoding controls: codec, pixel format, CRF quality, preset speed.
+- Audio controls: copy/re-encode/remove plus bitrate.
+- Two-pass encoding option.
+- FPS override support.
+- Global RIFE post-process for all upscaler outputs (multiplier, model, precision, CUDA device).
+- Chunk-safe Global RIFE mode (process per chunk before merge).
+- Comparison mode selector: native/slider/side-by-side/overlay-style options.
+- Image comparison and custom HTML video comparison slider outputs.
+- Generated input-vs-output comparison video (auto/horizontal/vertical layout).
+- Direct “compare any 2 videos” tool with fullscreen-capable slider UI.
+- Pin/unpin reference frame for iterative comparisons across runs.
+- Fullscreen and zoom-oriented comparison preferences.
+- Metadata/telemetry settings exposed in Output tab.
+
+##   Tier 3: Scale, Throughput, and Long-Run Processing
+
+  - Universal PySceneDetect-based chunking for all major pipelines.
+- Static chunking fallback (fixed seconds + overlap).
+- Frame-accurate split option (lossless path) vs fast keyframe-based split path.
+- Per-chunk cleanup option to save disk.
+- SeedVR2 native streaming chunk mode (frame-count chunks) in addition to universal chunking.
+- Resume interrupted chunk runs from partial outputs.
+- Batch processing in SeedVR2, GAN, RIFE, FlashVSR+, and Face standalone flow.
+- Batch overwrite/skip behavior controls.
+- Per-item batch output folder organization and run-dir management.
+- Application-level FIFO processing queue across tabs (single active job, waiting jobs).
+- Queue monitor tab with refresh, delete selected waiting jobs, and clear-all waiting.
+- Queue snapshot isolation so queued jobs run with their captured settings.
+- Queue-disabled mode option to ignore extra clicks while busy.
+
+##  Tier 4: Universal preset system that stores all tab settings in one preset file.
+- Auto-load last-used universal preset at startup.
+- Shared-state sync so loading one preset propagates to all tabs.
+- Per-tab model-context presets still supported (save/load/delete/last-used).
+- Preset migration/backward compatibility and auto-merge with new defaults.
+- Preset guardrails (auto-corrections for invalid combos).
+- Global settings persistence (global.json) for output/temp/telemetry/queue/mode/model-cache paths.
+- Named global config profiles (save/load/delete) in Global Settings.
+
+##   Tier 5: Reliability, Safety, and Recovery
+- Default subprocess execution mode with strong cancellation and cleanup behavior.
+- Confirm-cancel safety checkbox in processing tabs.
+- VRAM OOM detection and prominent OOM alert banner with remediation guidance.
+- Best-effort salvage of partial outputs on cancellation/failure.
+- Collision-safe output naming to avoid overwrite.
+- Structured per-run metadata and telemetry logging.
+- Command logging for executed processing commands and failures.
+- Input/settings validation guardrails (batch-size constraints, tile overlap constraints, GPU spec validation,
+compatibility checks).
+- Automatic ffmpeg-related checks and fallbacks in multiple paths.
+- Audio preservation/replacement utilities for merged/chunked outputs.
+
+##   Tier 6: System Diagnostics and Environment Control
+
+  - Health checks for ffmpeg, CUDA, VS Build Tools, writable dirs, and disk space.
+- Gradio compatibility and source scan reporting.
+- Repository scan for bundled external components (SeedVR2, Real-ESRGAN, Open Model Database).
+- GPU detection utilities designed to avoid unwanted parent-process CUDA context allocation.
+- Model discovery registries for SeedVR2/RIFE/FlashVSR/GAN.
+- Launcher environment variable integration (TEMP/TMP, MODELS_DIR, HF_HOME, TRANSFORMERS_CACHE, HF_DATASETS_CACHE).
+- Editable model cache path controls in Global Settings with restart guidance.
+
+##   Tier 7: UX and Operational Convenience (Least Important)
+
+  - File upload plus manual path entry in all major tabs.
+- Auto media preview (image/video) in tabs.
+- Input auto-detection (video/image/frame sequence/directory) with diagnostics.
+- Missing-frame detection for frame-sequence inputs.
+- Resolution calculator and chunk estimator panels with disk-space warnings.
+- “Use SeedVR2 input” quick-link from Resolution tab.
+- Open output folder and clear temp-folder actions from tabs.
+- Live progress indicators, chunk progress text, and ETA/status messaging.
+- SeedVR2 model status panel with refresh and auto-refresh.
+- Manual CUDA cache clear actions from UI.
+- --share launch flag support for Gradio sharing.

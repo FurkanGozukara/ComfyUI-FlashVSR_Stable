@@ -203,6 +203,18 @@ For more information, visit: https://github.com/naxci1/ComfyUI-FlashVSR_Stable
         help='Local attention range window. 9 = sharper details; 11 = more stable/consistent results. (default: 11)'
     )
     parser.add_argument(
+        '--cfg_scale',
+        type=float,
+        default=1.0,
+        help='Experimental latent update gain. 1.0 keeps default behavior. Higher can increase diffusion impact. (default: 1.0)'
+    )
+    parser.add_argument(
+        '--denoise_amount',
+        type=float,
+        default=1.0,
+        help='Experimental one-step denoise strength. 1.0 keeps default behavior. Higher can increase detail/artifacts. (default: 1.0)'
+    )
+    parser.add_argument(
         '--seed',
         type=int,
         default=0,
@@ -705,6 +717,16 @@ def main():
         args.av1_film_grain = 8
     args.av1_film_grain = max(0, min(50, int(args.av1_film_grain)))
     args.av1_film_grain_denoise = bool(int(args.av1_film_grain_denoise))
+    try:
+        args.cfg_scale = float(args.cfg_scale)
+    except Exception:
+        args.cfg_scale = 1.0
+    args.cfg_scale = max(0.5, min(2.0, args.cfg_scale))
+    try:
+        args.denoise_amount = float(args.denoise_amount)
+    except Exception:
+        args.denoise_amount = 1.0
+    args.denoise_amount = max(0.5, min(2.0, args.denoise_amount))
 
     # Safety check: ensure output file does not already exist
     if os.path.exists(args.output):
@@ -735,6 +757,7 @@ def main():
     print(f"Model: {args.model}, Mode: {args.mode}")
     print(f"VAE: {args.vae_model}, Scale: {args.scale}x")
     print(f"Tiling: tiled_vae={args.tiled_vae}, tiled_dit={args.tiled_dit}, tile_size={args.tile_size}, tile_overlap={args.tile_overlap}")
+    print(f"Diffusion: cfg_scale={args.cfg_scale:.2f}, denoise_amount={args.denoise_amount:.2f}")
     print(
         "Encoder: "
         f"codec={args.codec}, crf={args.crf}, preset={args.video_preset}, "
@@ -938,6 +961,8 @@ def main():
                     sparse_ratio=args.sparse_ratio,
                     kv_ratio=args.kv_ratio,
                     local_range=args.local_range,
+                    cfg_scale=args.cfg_scale,
+                    denoise_amount=args.denoise_amount,
                     seed=args.seed,
                     force_offload=effective_force_offload,
                     enable_debug=args.enable_debug,
@@ -967,6 +992,8 @@ def main():
                     sparse_ratio=args.sparse_ratio,
                     kv_ratio=args.kv_ratio,
                     local_range=args.local_range,
+                    cfg_scale=args.cfg_scale,
+                    denoise_amount=args.denoise_amount,
                     seed=args.seed,
                     force_offload=effective_force_offload,
                     enable_debug=args.enable_debug,

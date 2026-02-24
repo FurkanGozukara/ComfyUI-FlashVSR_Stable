@@ -352,7 +352,25 @@ class FlashVSRFullPipeline(BasePipeline):
         enable_debug_logging = False, # Pass debug flag if needed
     ):
         # 只接受 cfg=1.0（与原代码一致）
-        assert cfg_scale == 1.0, "cfg_scale must be 1.0"
+        try:
+            cfg_scale = float(cfg_scale)
+        except Exception:
+            cfg_scale = 1.0
+        cfg_scale = max(0.5, min(2.0, cfg_scale))
+        try:
+            denoising_strength = float(denoising_strength)
+        except Exception:
+            denoising_strength = 1.0
+        denoising_strength = max(0.5, min(2.0, denoising_strength))
+        latent_update_scale = max(0.25, min(3.0, cfg_scale * denoising_strength))
+        if enable_debug_logging and (
+            abs(cfg_scale - 1.0) > 1e-6 or abs(denoising_strength - 1.0) > 1e-6
+        ):
+            print(
+                f"[FlashVSR] Experimental diffusion controls: "
+                f"cfg_scale={cfg_scale:.3f}, denoising_strength={denoising_strength:.3f}, "
+                f"latent_update_scale={latent_update_scale:.3f}"
+            )
 
         # 要求：必须先 init_cross_kv()
         if self.prompt_emb_posi is None or 'context' not in self.prompt_emb_posi:
@@ -478,7 +496,7 @@ class FlashVSRFullPipeline(BasePipeline):
                 )
 
                 # 更新 latent
-                cur_latents = cur_latents - noise_pred_posi
+                cur_latents = cur_latents - noise_pred_posi * latent_update_scale
 
                 if tiled:
                     latents_total.append(cur_latents)

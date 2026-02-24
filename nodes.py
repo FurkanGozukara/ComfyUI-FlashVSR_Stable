@@ -1020,7 +1020,27 @@ class cqdm:
     def __len__(self):
         return self.total
 
-def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, force_offload, enable_debug, is_single_frame_input=False, stream_output_callback=None):
+def process_chunk(
+    pipe,
+    frames,
+    scale,
+    color_fix,
+    tiled_vae,
+    tiled_dit,
+    tile_size,
+    tile_overlap,
+    unload_dit,
+    sparse_ratio,
+    kv_ratio,
+    local_range,
+    seed,
+    force_offload,
+    enable_debug,
+    is_single_frame_input=False,
+    stream_output_callback=None,
+    cfg_scale=1.0,
+    denoise_amount=1.0,
+):
     """
     Processes a single chunk of frames.
     
@@ -1036,6 +1056,16 @@ def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_siz
     _frames = frames
     _device = pipe.device
     dtype = pipe.torch_dtype
+    try:
+        cfg_scale = float(cfg_scale)
+    except Exception:
+        cfg_scale = 1.0
+    cfg_scale = max(0.5, min(2.0, cfg_scale))
+    try:
+        denoise_amount = float(denoise_amount)
+    except Exception:
+        denoise_amount = 1.0
+    denoise_amount = max(0.5, min(2.0, denoise_amount))
     
     # Store original dimensions for cropping (FIX 3)
     original_H, original_W = frames.shape[1], frames.shape[2]
@@ -1088,7 +1118,7 @@ def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_siz
                 )
 
             output_tile_gpu = pipe(
-                prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=seed, tiled=tiled_vae,
+                prompt="", negative_prompt="", cfg_scale=cfg_scale, denoising_strength=denoise_amount, num_inference_steps=1, seed=seed, tiled=tiled_vae,
                 progress_bar_cmd=cqdm_tile, LQ_video=LQ_tile, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
                 topk_ratio=sparse_ratio*768*1280/(th*tw), kv_ratio=kv_ratio, local_range=local_range,
                 color_fix=color_fix, unload_dit=unload_dit, force_offload=force_offload,
@@ -1189,7 +1219,7 @@ def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_siz
             streamed_frames += int(chunk_video.shape[0])
 
         pipe_kwargs = dict(
-            prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=seed, tiled=tiled_vae,
+            prompt="", negative_prompt="", cfg_scale=cfg_scale, denoising_strength=denoise_amount, num_inference_steps=1, seed=seed, tiled=tiled_vae,
             progress_bar_cmd=cqdm_debug, LQ_video=LQ, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
             topk_ratio=sparse_ratio*768*1280/(th*tw), kv_ratio=kv_ratio, local_range=local_range,
             color_fix=color_fix, unload_dit=unload_dit, force_offload=force_offload,
@@ -1243,7 +1273,29 @@ def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_siz
 
     return final_output[:frames.shape[0], :, :, :]
 
-def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, force_offload, enable_debug=False, chunk_size=0, resize_factor=1.0, mode="full", stream_output_callback=None):
+def flashvsr(
+    pipe,
+    frames,
+    scale,
+    color_fix,
+    tiled_vae,
+    tiled_dit,
+    tile_size,
+    tile_overlap,
+    unload_dit,
+    sparse_ratio,
+    kv_ratio,
+    local_range,
+    seed,
+    force_offload,
+    enable_debug=False,
+    chunk_size=0,
+    resize_factor=1.0,
+    mode="full",
+    stream_output_callback=None,
+    cfg_scale=1.0,
+    denoise_amount=1.0,
+):
     """
     =============================================================================
     FIX 9 & 10: Unified Processing Pipeline with Pre-Flight Check
@@ -1372,6 +1424,8 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
                         local_range, seed, force_offload, enable_debug,
                         is_single_frame_input=is_single_frame_input,
                         stream_output_callback=stream_output_callback,
+                        cfg_scale=cfg_scale,
+                        denoise_amount=denoise_amount,
                     )
                     if chunk_out is not None:
                         final_outputs.append(chunk_out.cpu())
@@ -1410,6 +1464,8 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
                     local_range, seed, force_offload, enable_debug,
                     is_single_frame_input=is_single_frame_input,
                     stream_output_callback=stream_output_callback,
+                    cfg_scale=cfg_scale,
+                    denoise_amount=denoise_amount,
                 )
                 break
             except torch.OutOfMemoryError as e:

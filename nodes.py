@@ -729,10 +729,21 @@ def prepare_input_tensor(image_tensor: torch.Tensor, device, scale: int = 4, dty
 
 def calculate_tile_coords(height, width, tile_size, overlap):
     coords = []
-    
-    stride = tile_size - overlap
-    num_rows = math.ceil((height - overlap) / stride)
-    num_cols = math.ceil((width - overlap) / stride)
+
+    height = int(height)
+    width = int(width)
+    tile_size = max(1, int(tile_size))
+    overlap = max(0, int(overlap))
+
+    if height <= 0 or width <= 0:
+        return coords
+
+    stride = max(1, tile_size - overlap)
+
+    # Ensure we always emit at least one tile even if overlap is larger
+    # than the current frame dimensions (common after resize_factor downscale).
+    num_rows = max(1, math.ceil(max(1, height - overlap) / stride))
+    num_cols = max(1, math.ceil(max(1, width - overlap) / stride))
     
     for r in range(num_rows):
         for c in range(num_cols):
@@ -772,8 +783,17 @@ def calculate_vae_tiler_kwargs(tile_size_px: int, tile_overlap_px: int, latent_h
 
 def create_feather_mask(size, overlap):
     H, W = size
+    H = int(H)
+    W = int(W)
     mask = torch.ones(1, 1, H, W)
-    ramp = torch.linspace(0, 1, overlap)
+
+    # Clamp overlap so broadcasting always matches current tile size.
+    max_overlap = max(0, min(H, W) - 1)
+    overlap = max(0, min(int(overlap), max_overlap))
+    if overlap <= 0:
+        return mask
+
+    ramp = torch.linspace(0, 1, overlap, dtype=mask.dtype, device=mask.device)
     
     mask[:, :, :, :overlap] = torch.minimum(mask[:, :, :, :overlap], ramp.view(1, 1, 1, -1))
     mask[:, :, :, -overlap:] = torch.minimum(mask[:, :, :, -overlap:], ramp.flip(0).view(1, 1, 1, -1))
@@ -1355,6 +1375,31 @@ def flashvsr(
     
     # Get current dimensions (after potential resize)
     N, H, W, C = frames.shape
+
+    # Guard tiling overlap against post-resize dimensions to prevent empty tile
+    # sets (black output) and invalid feather-mask shapes.
+    if tiled_dit or tiled_vae:
+        tile_size = max(32, int(tile_size))
+        tile_overlap = max(0, int(tile_overlap))
+
+        if tile_overlap >= tile_size:
+            old_overlap = tile_overlap
+            tile_overlap = max(8, tile_size - 8)
+            log(
+                f"Adjusted tile_overlap from {old_overlap} to {tile_overlap} because overlap must be smaller than tile_size ({tile_size}).",
+                message_type='warning',
+                icon="!"
+            )
+
+        max_overlap_for_frame = max(0, min(int(H), int(W)) - 1)
+        if tile_overlap > max_overlap_for_frame:
+            old_overlap = tile_overlap
+            tile_overlap = max_overlap_for_frame
+            log(
+                f"Adjusted tile_overlap from {old_overlap} to {tile_overlap} for current frame size {W}x{H}.",
+                message_type='warning',
+                icon="!"
+            )
 
     # ==========================================================================
     # FIX 5 & 10: Unified Debug Logging (same for all modes)

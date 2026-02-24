@@ -23,10 +23,24 @@ if not torch.cuda.is_available():
 
 from nodes import flashvsr, FlashVSRNodeInitPipe, FlashVSRNode, FlashVSRNodeAdv, VAE_MODEL_OPTIONS, VAE_MODEL_MAP
 from nodes import estimate_vram_usage, get_optimal_settings, check_resources
+from nodes import calculate_tile_coords, create_feather_mask
 from src.pipelines.flashvsr_full import FlashVSRFullPipeline
 from src.models.wan_video_vae import WanVideoVAE, Wan22VideoVAE, LightX2VVAE, create_video_vae
 
 class TestFlashVSRNodes(unittest.TestCase):
+    def test_calculate_tile_coords_handles_overlap_larger_than_frame(self):
+        """Tile generation must still return at least one tile after strong resize."""
+        coords = calculate_tile_coords(height=216, width=286, tile_size=704, overlap=512)
+        self.assertEqual(len(coords), 1)
+        self.assertEqual(coords[0], (0, 0, 286, 216))
+
+    def test_create_feather_mask_clamps_overlap_to_tile_size(self):
+        """Large overlap values should be clamped instead of crashing."""
+        mask = create_feather_mask((1144, 1144), overlap=2048)
+        self.assertEqual(mask.shape, (1, 1, 1144, 1144))
+        self.assertTrue(torch.isfinite(mask).all())
+        self.assertGreater(mask.sum().item(), 0.0)
+
     def test_pipeline_instantiation(self):
         # We can't easily instantiate the full pipeline without models,
         # but we can check if the class loads and methods exist.

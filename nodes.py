@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 FlashVSR ComfyUI Node - Video Super Resolution
@@ -26,6 +26,7 @@ import sys
 import psutil
 import yaml
 import threading
+import unicodedata
 
 import numpy as np
 import torch.nn.functional as F
@@ -166,7 +167,7 @@ def load_model_paths_config():
                     flashvsr_path = os.path.abspath(os.path.join(current_dir, flashvsr_path))
                 
                 log(f"Custom FlashVSR model path loaded from config: {flashvsr_path}", 
-                    message_type='info', icon="📂")
+                    message_type='info', icon="ðŸ“‚")
                 
                 with _config_lock:
                     _cached_model_path = flashvsr_path
@@ -174,7 +175,7 @@ def load_model_paths_config():
                 return flashvsr_path
     except Exception as e:
         log(f"Warning: Could not load model_paths.yaml: {e}. Using default path.", 
-            message_type='warning', icon="⚠️")
+            message_type='warning', icon="âš ï¸")
     
     with _config_lock:
         _config_loaded = True
@@ -182,8 +183,98 @@ def load_model_paths_config():
 
 device_choices = get_device_list()
 
+_MOJIBAKE_MARKERS = (
+    "\u00f0",
+    "\u00e2",
+    "\u00ef",
+    "\u00c3",
+    "\u0153",
+    "\u0178",
+    "\x81",
+    "\x8d",
+    "\x8f",
+    "\x90",
+    "\x9d",
+)
+
+_ICON_REPLACEMENTS = {
+    "\u2705": "[OK]",
+    "\u274c": "[ERROR]",
+    "\u26a0": "[WARN]",
+    "\u2139": "[INFO]",
+    "\U0001f50d": "[CHECK]",
+    "\U0001f4bb": "[RAM]",
+    "\U0001f4be": "[VRAM]",
+    "\U0001f4ca": "[STATS]",
+    "\U0001f4a1": "[TIP]",
+    "\u2b07": "[DOWNLOAD]",
+    "\U0001f310": "[NET]",
+    "\U0001f4e6": "[MODEL]",
+    "\U0001f4c1": "[PATH]",
+    "\U0001f4c2": "[PATH]",
+    "\U0001f527": "[PIPELINE]",
+    "\U0001f3ac": "[VIDEO]",
+    "\U0001f39e": "[VIDEO]",
+    "\U0001f680": "[RUN]",
+    "\U0001f504": "[RETRY]",
+    "\u23f1": "[TIME]",
+    "\u2702": "[CHUNK]",
+    "\U0001f4c9": "[RESIZE]",
+    "\U0001f41e": "[DEBUG]",
+    "\U0001f5a5": "[GPU]",
+    "\u2699": "[CONFIG]",
+    "\U0001f9e9": "[TILE]",
+    "\U0001f6e1": "[SAFE]",
+    "\U0001f4e5": "[INPUT]",
+    "\U0001f4e4": "[OUTPUT]",
+    "\U0001f4c8": "[PEAK]",
+    "\u2022": "-",
+}
+
+def _repair_utf8_mojibake(text: str) -> str:
+    text = str(text)
+    if not any(marker in text for marker in _MOJIBAKE_MARKERS):
+        return text
+
+    raw_bytes = bytearray()
+    for char in text:
+        code_point = ord(char)
+        if code_point <= 0xFF:
+            raw_bytes.append(code_point)
+            continue
+
+        try:
+            raw_bytes.extend(char.encode("cp1252"))
+        except UnicodeEncodeError:
+            return text
+
+    try:
+        return raw_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return text
+
+def _normalize_console_text(text: str) -> str:
+    normalized = _repair_utf8_mojibake(text).replace("\ufe0f", "")
+
+    for unicode_icon, ascii_label in _ICON_REPLACEMENTS.items():
+        normalized = normalized.replace(unicode_icon, ascii_label)
+
+    cleaned_chars = []
+    for char in normalized:
+        code_point = ord(char)
+        if 0x80 <= code_point <= 0x9F:
+            continue
+        if unicodedata.category(char) in {"So", "Sk"}:
+            continue
+        cleaned_chars.append(char)
+
+    return "".join(cleaned_chars)
+
 def log(message: str, message_type: str = 'normal', icon: str = "", end: str = "\n", in_place: bool = False):
-    if icon:
+    message = _normalize_console_text(message)
+    icon = _normalize_console_text(icon).strip()
+
+    if icon and not message.startswith(icon):
         message = f"{icon} {message}"
         
     if message_type == 'error':
@@ -223,7 +314,7 @@ def log_resource_usage(prefix="Resource Usage", end="\n", in_place=False):
         vram_used, vram_reserved, vram_total = get_vram_info()
         msg += f" | VRAM: {vram_used:.1f}/{vram_reserved:.1f}/{vram_total:.1f}G"
         
-    log(msg, message_type='info', icon="📊", end=end, in_place=in_place)
+    log(msg, message_type='info', icon="ðŸ“Š", end=end, in_place=in_place)
 
 
 # =============================================================================
@@ -453,11 +544,11 @@ def check_resources(width, height, num_frames, scale, chunk_size, resize_factor,
             msg_parts.append("tiled_dit=True")
         
         if msg_parts:
-            result["message"] = f"⚠️ Current settings require ~{result['estimated_vram_gb']:.1f}GB but only {result['available_vram_gb']:.1f}GB available. Recommended: {', '.join(msg_parts)}"
+            result["message"] = f"âš ï¸ Current settings require ~{result['estimated_vram_gb']:.1f}GB but only {result['available_vram_gb']:.1f}GB available. Recommended: {', '.join(msg_parts)}"
         else:
-            result["message"] = f"⚠️ VRAM critically low. Estimated ~{result['estimated_vram_gb']:.1f}GB needed, only {result['available_vram_gb']:.1f}GB available."
+            result["message"] = f"âš ï¸ VRAM critically low. Estimated ~{result['estimated_vram_gb']:.1f}GB needed, only {result['available_vram_gb']:.1f}GB available."
     else:
-        result["message"] = f"✅ Safe to proceed. Estimated ~{result['estimated_vram_gb']:.1f}GB needed, {result['available_vram_gb']:.1f}GB available."
+        result["message"] = f"âœ… Safe to proceed. Estimated ~{result['estimated_vram_gb']:.1f}GB needed, {result['available_vram_gb']:.1f}GB available."
     
     return result
 
@@ -471,28 +562,28 @@ def log_preflight_check(width, height, num_frames, scale, chunk_size, resize_fac
                               tiled_vae, tiled_dit, mode)
     
     log("=" * 60, message_type='info')
-    log("PRE-FLIGHT RESOURCE CHECK", message_type='info', icon="🔍")
-    log(f"RAM: {result['ram_used_gb']:.1f}GB / {result['ram_total_gb']:.1f}GB", message_type='info', icon="💻")
-    log(f"VRAM Available: {result['available_vram_gb']:.1f}GB", message_type='info', icon="💾")
-    log(f"Estimated VRAM Required: {result['estimated_vram_gb']:.1f}GB", message_type='info', icon="📊")
+    log("PRE-FLIGHT RESOURCE CHECK", message_type='info', icon="ðŸ”")
+    log(f"RAM: {result['ram_used_gb']:.1f}GB / {result['ram_total_gb']:.1f}GB", message_type='info', icon="ðŸ’»")
+    log(f"VRAM Available: {result['available_vram_gb']:.1f}GB", message_type='info', icon="ðŸ’¾")
+    log(f"Estimated VRAM Required: {result['estimated_vram_gb']:.1f}GB", message_type='info', icon="ðŸ“Š")
     
     if result["will_oom"]:
-        log(result["message"], message_type='warning', icon="⚠️")
+        log(result["message"], message_type='warning', icon="âš ï¸")
         if result["recommended_settings"]:
             rec = result["recommended_settings"]
-            log("Recommended Optimal Settings:", message_type='info', icon="💡")
+            log("Recommended Optimal Settings:", message_type='info', icon="ðŸ’¡")
             if rec["chunk_size"] > 0:
-                log(f"  • chunk_size = {rec['chunk_size']}", message_type='info')
+                log(f"  â€¢ chunk_size = {rec['chunk_size']}", message_type='info')
             if rec["resize_factor"] < 1.0:
-                log(f"  • resize_factor = {rec['resize_factor']:.1f}", message_type='info')
+                log(f"  â€¢ resize_factor = {rec['resize_factor']:.1f}", message_type='info')
             if rec["tiled_vae"]:
-                log(f"  • tiled_vae = True", message_type='info')
+                log(f"  â€¢ tiled_vae = True", message_type='info')
             if rec["tiled_dit"]:
-                log(f"  • tiled_dit = True", message_type='info')
+                log(f"  â€¢ tiled_dit = True", message_type='info')
             if rec.get("warning"):
-                log(f"  ⚠️ {rec['warning']}", message_type='warning')
+                log(f"  âš ï¸ {rec['warning']}", message_type='warning')
     else:
-        log(result["message"], message_type='finish', icon="✅")
+        log(result["message"], message_type='finish', icon="âœ…")
     
     log("=" * 60, message_type='info')
     
@@ -513,12 +604,12 @@ def log_vram_advisory(width, height, num_frames, scale, tiled_vae, tiled_dit, mo
     free_vram = available_vram - current_used
     
     log(f"VRAM Advisory: Estimated ~{estimated_vram:.1f}GB needed, Available: {free_vram:.1f}GB free of {available_vram:.1f}GB total", 
-        message_type='info', icon="💡")
+        message_type='info', icon="ðŸ’¡")
     
     if estimated_vram > free_vram * 0.9:
-        log("⚠️ Warning: High VRAM usage expected. Recommend enabling Tiled VAE/DiT.", message_type='warning', icon="⚠️")
+        log("âš ï¸ Warning: High VRAM usage expected. Recommend enabling Tiled VAE/DiT.", message_type='warning', icon="âš ï¸")
     elif estimated_vram < free_vram * 0.5:
-        log("✅ Safe to proceed. VRAM usage should be comfortable.", message_type='info', icon="✅")
+        log("âœ… Safe to proceed. VRAM usage should be comfortable.", message_type='info', icon="âœ…")
 
 def get_flashvsr_model_base_dir():
     """
@@ -534,7 +625,7 @@ def model_download(model_name="JunhaoZhuang/FlashVSR"):
     base_dir = get_flashvsr_model_base_dir()
     model_dir = os.path.join(base_dir, model_name.split("/")[-1])
     if not os.path.exists(model_dir):
-        log(f"Downloading model '{model_name}' from huggingface...", message_type='info', icon="⬇️")
+        log(f"Downloading model '{model_name}' from huggingface...", message_type='info', icon="â¬‡ï¸")
         snapshot_download(repo_id=model_name, local_dir=model_dir, local_dir_use_symlinks=False, resume_download=True)
 
 
@@ -556,24 +647,24 @@ def download_vae_if_missing(vae_file: str, model_path: str, vae_config: dict) ->
     vae_path = os.path.join(model_path, vae_file)
     
     if os.path.exists(vae_path):
-        log(f"VAE file found: {vae_file}", message_type='info', icon="✅")
+        log(f"VAE file found: {vae_file}", message_type='info', icon="âœ…")
         return vae_path
     
-    log(f"VAE file '{vae_file}' not found. Attempting auto-download...", message_type='warning', icon="⬇️")
+    log(f"VAE file '{vae_file}' not found. Attempting auto-download...", message_type='warning', icon="â¬‡ï¸")
     
     # Get URL from config (FIX 6: Use EXACT URLs from VAE_MODEL_MAP)
     url = vae_config.get("url")
     
     if url:
         try:
-            log(f"Downloading from: {url}", message_type='info', icon="🌐")
+            log(f"Downloading from: {url}", message_type='info', icon="ðŸŒ")
             # Ensure directory exists
             os.makedirs(model_path, exist_ok=True)
             torch.hub.download_url_to_file(url, vae_path, progress=True)
-            log(f"Successfully downloaded VAE: {vae_file}", message_type='finish', icon="✅")
+            log(f"Successfully downloaded VAE: {vae_file}", message_type='finish', icon="âœ…")
             return vae_path
         except Exception as e:
-            log(f"Download failed: {e}", message_type='error', icon="❌")
+            log(f"Download failed: {e}", message_type='error', icon="âŒ")
     
     raise RuntimeError(
         f'VAE file "{vae_file}" not found and auto-download failed.\n'
@@ -834,7 +925,7 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1"):
     # FIX 2 & 7: VAE Model Loading - EXPLICIT mapping (no guessing!)
     # ==========================================================================
     if vae_model not in VAE_MODEL_MAP:
-        log(f"Unknown VAE model '{vae_model}', defaulting to Wan2.1", message_type='warning', icon="⚠️")
+        log(f"Unknown VAE model '{vae_model}', defaulting to Wan2.1", message_type='warning', icon="âš ï¸")
         vae_model = "Wan2.1"
     
     vae_config = VAE_MODEL_MAP[vae_model]
@@ -846,14 +937,14 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1"):
     
     # Debug logging - Show EXACTLY which file and class will be used
     log(f"VAE Selection: '{vae_model}' -> File: '{vae_file}' -> Class: {vae_class.__name__}", 
-        message_type='info', icon="🔍")
+        message_type='info', icon="ðŸ”")
     
     # ==========================================================================
     # FIX 6: Auto-download VAE if missing
     # ==========================================================================
     vae_path = download_vae_if_missing(vae_file, model_path, vae_config)
     
-    log(f"VAE file path confirmed: {vae_path}", message_type='info', icon="📁")
+    log(f"VAE file path confirmed: {vae_path}", message_type='info', icon="ðŸ“")
     
     lq_path = os.path.join(model_path, "LQ_proj_in.ckpt")
     if not os.path.exists(lq_path):
@@ -873,7 +964,7 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1"):
         # FIX 7: EXPLICIT VAE class instantiation - NO guessing from state_dict
         # =======================================================================
         log(f"Creating EXPLICIT VAE instance: {vae_class.__name__} (dim={vae_dim}, z_dim={vae_z_dim})", 
-            message_type='info', icon="📦")
+            message_type='info', icon="ðŸ“¦")
         
         # Load weights from file
         if vae_path.endswith(".safetensors"):
@@ -898,15 +989,15 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1"):
         load_result = pipe.vae.load_state_dict(sd, strict=False)
         if load_result.missing_keys:
             log(f"VAE missing keys: {len(load_result.missing_keys)} (expected for Light* models)", 
-                message_type='info', icon="ℹ️")
+                message_type='info', icon="â„¹ï¸")
         if load_result.unexpected_keys:
             log(f"VAE unexpected keys: {len(load_result.unexpected_keys)}", 
-                message_type='info', icon="ℹ️")
+                message_type='info', icon="â„¹ï¸")
         
         pipe.vae = pipe.vae.to(device=device, dtype=dtype)
         
-        log(f"Loaded VAE weights from: {vae_path}", message_type='info', icon="✅")
-        log(f"VAE Type Active: {type(pipe.vae).__name__}", message_type='info', icon="📦")
+        log(f"Loaded VAE weights from: {vae_path}", message_type='info', icon="âœ…")
+        log(f"VAE Type Active: {type(pipe.vae).__name__}", message_type='info', icon="ðŸ“¦")
 
         pipe.vae.model.encoder = None
         pipe.vae.model.conv1 = None
@@ -921,7 +1012,7 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1"):
         pipe.TCDecoder = build_tcdecoder(new_channels=multi_scale_channels, device=device, dtype=dtype, new_latent_channels=16+768)
         mis = pipe.TCDecoder.load_state_dict(torch.load(tcd_path, map_location=device, weights_only=False), strict=False)
         pipe.TCDecoder.clean_mem()
-        log(f"Loaded TCDecoder for Full Mode (official FlashVSR approach)", message_type='info', icon="✅")
+        log(f"Loaded TCDecoder for Full Mode (official FlashVSR approach)", message_type='info', icon="âœ…")
     else:
         mm.load_models([ckpt_path])
         if mode == "tiny":
@@ -950,8 +1041,8 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1"):
     if hasattr(pipe, 'vae') and pipe.vae is not None:
         vae_info += f" ({type(pipe.vae).__name__})"
     
-    log(f"Pipeline Initialized: Mode={mode}, Device={device}, Dtype={dtype}, Attention={wan_video_dit.ATTENTION_MODE}", message_type='info', icon="🔧")
-    log(f"Model: {model}, {vae_info}", message_type='info', icon="📦")
+    log(f"Pipeline Initialized: Mode={mode}, Device={device}, Dtype={dtype}, Attention={wan_video_dit.ATTENTION_MODE}", message_type='info', icon="ðŸ”§")
+    log(f"Model: {model}, {vae_info}", message_type='info', icon="ðŸ“¦")
 
     return pipe
 
@@ -1002,7 +1093,7 @@ class cqdm:
             perc = (self.step_idx / self.total) * 100
             bar_len = 20
             filled = int(bar_len * self.step_idx // self.total)
-            bar = '█' * filled + '░' * (bar_len - filled)
+            bar = 'â–ˆ' * filled + 'â–‘' * (bar_len - filled)
 
             elapsed = time.time() - self.start_time
             rate = self.step_idx / elapsed if elapsed > 0 else 0
@@ -1026,7 +1117,7 @@ class cqdm:
             total_time = time.time() - self.start_time
             if self.enable_debug:
                 # Use print with newline here to finalize the log block
-                print(f"\n✅ Loop '{self.desc}' finished in {total_time:.2f}s", flush=True)
+                print(f"\nâœ… Loop '{self.desc}' finished in {total_time:.2f}s", flush=True)
             raise
             
     def __enter__(self):
@@ -1107,7 +1198,7 @@ def process_chunk(
         weight_sum_canvas = torch.zeros_like(final_output_canvas)
         tile_coords = calculate_tile_coords(H, W, tile_size, tile_overlap)
         
-        log(f"Starting Tiled Processing: {len(tile_coords)} tiles", message_type='info', icon="🚀")
+        log(f"Starting Tiled Processing: {len(tile_coords)} tiles", message_type='info', icon="ðŸš€")
         
         # Create progress bar wrapper for tiled pipeline processing
         class cqdm_tile(cqdm):
@@ -1117,7 +1208,7 @@ def process_chunk(
         for i, (x1, y1, x2, y2) in enumerate(cqdm(tile_coords, desc="Processing Tiles", enable_debug=enable_debug)):
             tile_start = time.time()
             if enable_debug:
-                log(f"Processing tile {i+1}/{len(tile_coords)}: ({x1},{y1}) -> ({x2},{y2})", message_type='info', icon="🔄")
+                log(f"Processing tile {i+1}/{len(tile_coords)}: ({x1},{y1}) -> ({x2},{y2})", message_type='info', icon="ðŸ”„")
             
             input_tile = _frames[:, y1:y2, x1:x2, :]
             
@@ -1164,7 +1255,7 @@ def process_chunk(
             if enable_debug:
                 tile_end = time.time()
                 tile_time = tile_end - tile_start
-                log(f"Tile {i+1} completed in {tile_time:.2f}s", message_type='info', icon="⏱️")
+                log(f"Tile {i+1} completed in {tile_time:.2f}s", message_type='info', icon="â±ï¸")
             
             mask_nchw = create_feather_mask(
                 (processed_tile_cpu.shape[1], processed_tile_cpu.shape[2]),
@@ -1187,7 +1278,7 @@ def process_chunk(
         weight_sum_canvas[weight_sum_canvas == 0] = 1.0
         final_output = final_output_canvas / weight_sum_canvas
     else:
-        log("Preparing full frame processing...", message_type='info', icon="🎞️")
+        log("Preparing full frame processing...", message_type='info', icon="ðŸŽžï¸")
         if enable_debug:
             log_resource_usage(prefix="Pre-Preprocess")
         
@@ -1205,7 +1296,7 @@ def process_chunk(
                 latent_w=max(1, tw // 8),
             )
             
-        log(f"Processing {frames.shape[0]} frames...", message_type='info', icon="🚀")
+        log(f"Processing {frames.shape[0]} frames...", message_type='info', icon="ðŸš€")
         
         process_start = time.time()
 
@@ -1255,7 +1346,7 @@ def process_chunk(
         process_end = time.time()
         
         if enable_debug:
-            log(f"Inference completed in {process_end - process_start:.2f}s", message_type='info', icon="⏱️")
+            log(f"Inference completed in {process_end - process_start:.2f}s", message_type='info', icon="â±ï¸")
 
         if streaming_supported:
             del video, LQ
@@ -1276,7 +1367,7 @@ def process_chunk(
         if enable_debug:
             log(f"Cropped output from ({final_output_tensor.shape[1]}, {final_output_tensor.shape[2]}) "
                 f"to ({final_output.shape[1]}, {final_output.shape[2]}) removing padding", 
-                message_type='info', icon="✂️")
+                message_type='info', icon="âœ‚ï¸")
 
         del video, LQ
         clean_vram()
@@ -1350,7 +1441,7 @@ def flashvsr(
     # Use NEAREST interpolation for integer-like factors, BICUBIC otherwise
     # ==========================================================================
     if resize_factor < 1.0 and resize_factor > 0:
-        log(f"Resizing input by factor {resize_factor}...", message_type='info', icon="📉")
+        log(f"Resizing input by factor {resize_factor}...", message_type='info', icon="ðŸ“‰")
         orig_H, orig_W = frames.shape[1], frames.shape[2]
         new_H, new_W = int(orig_H * resize_factor), int(orig_W * resize_factor)
         
@@ -1361,11 +1452,11 @@ def flashvsr(
         if is_integer_scale:
             # Use NEAREST for potentially lossless integer downscaling
             frames_resized = F.interpolate(frames_permuted, size=(new_H, new_W), mode='nearest')
-            log(f"Using NEAREST interpolation (lossless for {resize_factor}x)", message_type='info', icon="🔍")
+            log(f"Using NEAREST interpolation (lossless for {resize_factor}x)", message_type='info', icon="ðŸ”")
         else:
             # Use BICUBIC for non-integer factors
             frames_resized = F.interpolate(frames_permuted, size=(new_H, new_W), mode='bicubic', align_corners=False)
-            log(f"Using BICUBIC interpolation for non-integer scaling", message_type='info', icon="🔍")
+            log(f"Using BICUBIC interpolation for non-integer scaling", message_type='info', icon="ðŸ”")
         
         frames = frames_resized.permute(0, 2, 3, 1)  # Back to NHWC
         del frames_permuted, frames_resized
@@ -1406,14 +1497,14 @@ def flashvsr(
     # ==========================================================================
     if enable_debug:
         _device = pipe.device
-        log(f"Debug Mode: Enabled", message_type='info', icon="🐞")
-        log(f"Device: {_device}", message_type='info', icon="🖥️")
-        log(f"Processing Mode: {mode}", message_type='info', icon="⚙️")
+        log(f"Debug Mode: Enabled", message_type='info', icon="ðŸž")
+        log(f"Device: {_device}", message_type='info', icon="ðŸ–¥ï¸")
+        log(f"Processing Mode: {mode}", message_type='info', icon="âš™ï¸")
         if torch.cuda.is_available():
-             log(f"Total VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB", message_type='info', icon="💾")
-        log(f"Input Frames: {frames.shape}", message_type='info', icon="🎞️")
-        log(f"Chunk Size: {chunk_size}", message_type='info', icon="📦")
-        log(f"Tiled DiT: {tiled_dit}, Tiled VAE: {tiled_vae}", message_type='info', icon="🧩")
+             log(f"Total VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB", message_type='info', icon="ðŸ’¾")
+        log(f"Input Frames: {frames.shape}", message_type='info', icon="ðŸŽžï¸")
+        log(f"Chunk Size: {chunk_size}", message_type='info', icon="ðŸ“¦")
+        log(f"Tiled DiT: {tiled_dit}, Tiled VAE: {tiled_vae}", message_type='info', icon="ðŸ§©")
         log_resource_usage(prefix="Start")
     
     # VRAM Advisory (FIX 5) - Enhanced with mode
@@ -1429,7 +1520,7 @@ def flashvsr(
         # FIX 5: Only trigger OOM recovery at 95% threshold (not 90%)
         if vram_usage_ratio > VRAM_OOM_THRESHOLD:
             log(f"Warning: VRAM usage is very high ({vram_usage_ratio*100:.1f}% > {VRAM_OOM_THRESHOLD*100:.0f}%)! Enabling fallback options is recommended.", 
-                message_type='warning', icon="⚠️")
+                message_type='warning', icon="âš ï¸")
 
     # Store input resolution for summary (FIX 8)
     input_resolution = f"{frames.shape[2]}x{frames.shape[1]}"
@@ -1439,19 +1530,25 @@ def flashvsr(
     total_frames = frames.shape[0]
     final_outputs = []
     final_output_tensor = None
+    disable_oom_recovery = str(os.environ.get("FLASHVSR_DISABLE_OOM_RECOVERY", "")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
     is_single_frame_input = (frames.shape[0] == 1)
 
     if chunk_size > 0 and chunk_size < total_frames:
         num_chunks = math.ceil(total_frames / chunk_size)
-        log(f"Splitting video into {num_chunks} chunks (size {chunk_size})...", message_type='info', icon="✂️")
+        log(f"Splitting video into {num_chunks} chunks (size {chunk_size})...", message_type='info', icon="âœ‚ï¸")
 
         for i in range(num_chunks):
             chunk_start = i * chunk_size
             chunk_end = min((i + 1) * chunk_size, total_frames)
 
             if enable_debug:
-                log(f"Processing Chunk {i+1}/{num_chunks}: Frames {chunk_start}-{chunk_end}", message_type='info', icon="🎞️")
+                log(f"Processing Chunk {i+1}/{num_chunks}: Frames {chunk_start}-{chunk_end}", message_type='info', icon="ðŸŽžï¸")
 
             chunk_frames = frames[chunk_start:chunk_end]
 
@@ -1480,16 +1577,23 @@ def flashvsr(
                 except torch.OutOfMemoryError as e:
                     retry_count += 1
                     clean_vram()
-                    log(f"OOM detected in Chunk {i+1} (Attempt {retry_count}). Recovering...", message_type='warning', icon="🔄")
+                    if disable_oom_recovery:
+                        log(
+                            "OOM recovery disabled by FLASHVSR_DISABLE_OOM_RECOVERY=1. Re-raising OOM.",
+                            message_type='error',
+                            icon="âŒ",
+                        )
+                        raise e
+                    log(f"OOM detected in Chunk {i+1} (Attempt {retry_count}). Recovering...", message_type='warning', icon="ðŸ”„")
 
                     if not current_tiled_vae:
-                        log("Auto-enabling Tiled VAE to prevent OOM (override)...", message_type='info', icon="🛡️")
+                        log("Auto-enabling Tiled VAE to prevent OOM (override)...", message_type='info', icon="ðŸ›¡ï¸")
                         current_tiled_vae = True
                     elif not current_tiled_dit:
-                        log("Auto-enabling Tiled DiT to prevent OOM (override)...", message_type='info', icon="🛡️")
+                        log("Auto-enabling Tiled DiT to prevent OOM (override)...", message_type='info', icon="ðŸ›¡ï¸")
                         current_tiled_dit = True
                     else:
-                        log("Both Tiled VAE and DiT enabled but still OOM. Cannot recover.", message_type='error', icon="❌")
+                        log("Both Tiled VAE and DiT enabled but still OOM. Cannot recover.", message_type='error', icon="âŒ")
                         raise e # Cannot recover further
 
         if final_outputs:
@@ -1516,16 +1620,23 @@ def flashvsr(
             except torch.OutOfMemoryError as e:
                 retry_count += 1
                 clean_vram()
-                log(f"OOM detected (Attempt {retry_count}). Recovering...", message_type='warning', icon="🔄")
+                if disable_oom_recovery:
+                    log(
+                        "OOM recovery disabled by FLASHVSR_DISABLE_OOM_RECOVERY=1. Re-raising OOM.",
+                        message_type='error',
+                        icon="âŒ",
+                    )
+                    raise e
+                log(f"OOM detected (Attempt {retry_count}). Recovering...", message_type='warning', icon="ðŸ”„")
 
                 if not current_tiled_vae:
-                    log("Auto-enabling Tiled VAE to prevent OOM (override)...", message_type='info', icon="🛡️")
+                    log("Auto-enabling Tiled VAE to prevent OOM (override)...", message_type='info', icon="ðŸ›¡ï¸")
                     current_tiled_vae = True
                 elif not current_tiled_dit:
-                    log("Auto-enabling Tiled DiT to prevent OOM (override)...", message_type='info', icon="🛡️")
+                    log("Auto-enabling Tiled DiT to prevent OOM (override)...", message_type='info', icon="ðŸ›¡ï¸")
                     current_tiled_dit = True
                 else:
-                    log("Both Tiled VAE and DiT enabled but still OOM. Cannot recover.", message_type='error', icon="❌")
+                    log("Both Tiled VAE and DiT enabled but still OOM. Cannot recover.", message_type='error', icon="âŒ")
                     raise e
 
     end_time = time.time()
@@ -1536,15 +1647,15 @@ def flashvsr(
     # FIX 8: Summary logging at end of processing
     # ==========================================================================
     log("=" * 60, message_type='info')
-    log("PROCESSING SUMMARY", message_type='finish', icon="📊")
-    log(f"Total Processing Time: {total_time:.2f}s ({fps:.2f} FPS)", message_type='info', icon="⏱️")
-    log(f"Input Resolution: {input_resolution} ({frames.shape[0]} frames)", message_type='info', icon="📥")
+    log("PROCESSING SUMMARY", message_type='finish', icon="ðŸ“Š")
+    log(f"Total Processing Time: {total_time:.2f}s ({fps:.2f} FPS)", message_type='info', icon="â±ï¸")
+    log(f"Input Resolution: {input_resolution} ({frames.shape[0]} frames)", message_type='info', icon="ðŸ“¥")
     out_frame_count = final_output_tensor.shape[0] if isinstance(final_output_tensor, torch.Tensor) else frames.shape[0]
-    log(f"Output Resolution: {output_resolution} ({out_frame_count} frames)", message_type='info', icon="📤")
+    log(f"Output Resolution: {output_resolution} ({out_frame_count} frames)", message_type='info', icon="ðŸ“¤")
     
     if torch.cuda.is_available():
         peak_memory = torch.cuda.max_memory_reserved() / 1024**3
-        log(f"Peak VRAM Used: {peak_memory:.2f} GB", message_type='info', icon="📈")
+        log(f"Peak VRAM Used: {peak_memory:.2f} GB", message_type='info', icon="ðŸ“ˆ")
         
     log_resource_usage(prefix="Final")
     log("=" * 60, message_type='info')
@@ -1617,10 +1728,10 @@ class FlashVSRNodeInitPipe:
         if precision == "auto":
             if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
                 precision = "bf16"
-                log("Auto-detected bf16 support.", message_type='info', icon="⚙️")
+                log("Auto-detected bf16 support.", message_type='info', icon="âš™ï¸")
             else:
                 precision = "fp16"
-                log("Defaulting to fp16.", message_type='info', icon="⚙️")
+                log("Defaulting to fp16.", message_type='info', icon="âš™ï¸")
             
         dtype_map = {
             "fp32": torch.float32,
@@ -1866,3 +1977,4 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FlashVSRNodeAdv": "FlashVSR Ultra-Fast (Advanced)",
     "FlashVSRInitPipe": "FlashVSR Init Pipeline",
 }
+

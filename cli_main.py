@@ -356,12 +356,20 @@ class VideoReader:
 
         self.fps = self.cap.get(cv2.CAP_PROP_FPS)
         self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        # When the whole input is requested (end_frame < 0), do not trust the container's
+        # frame-count metadata to decide when to stop: it can be off by one on some
+        # ffmpeg/OpenCV builds, which would silently drop the last frame(s) of every chunk.
+        # Read until the decoder reports EOF instead. Explicit start/end frames keep the
+        # old exact-window behaviour.
+        self.read_to_eof = (self.end_frame is None) or (int(self.end_frame) < 0)
         
         # Adjust end_frame
         if self.end_frame < 0 or self.end_frame > self.total_frames:
             self.end_frame = self.total_frames
             
-        if self.start_frame >= self.total_frames:
+        # A non-positive count means the container does not know its length (e.g. live/browser
+        # recordings without a duration); read_to_eof still reads every frame then.
+        if self.total_frames > 0 and self.start_frame >= self.total_frames:
             print(f"Warning: Start frame {self.start_frame} is beyond total frames {self.total_frames}.")
             self.end_frame = self.start_frame # Nothing to process
 
@@ -372,7 +380,7 @@ class VideoReader:
         return self
 
     def __next__(self):
-        if self.current_frame >= self.end_frame:
+        if not self.read_to_eof and self.current_frame >= self.end_frame:
             self.cap.release()
             raise StopIteration
 
@@ -381,10 +389,13 @@ class VideoReader:
         import cv2
 
         frames = []
-        frames_to_read = self.chunk_size if self.chunk_size > 0 else (self.end_frame - self.current_frame)
-        
-        # Ensure we don't read past end_frame
-        frames_to_read = min(frames_to_read, self.end_frame - self.current_frame)
+        if self.read_to_eof:
+            # Bounded only by chunk_size (or unbounded when 0); EOF ends the iteration.
+            frames_to_read = self.chunk_size if self.chunk_size > 0 else (1 << 31)
+        else:
+            frames_to_read = self.chunk_size if self.chunk_size > 0 else (self.end_frame - self.current_frame)
+            # Ensure we don't read past end_frame
+            frames_to_read = min(frames_to_read, self.end_frame - self.current_frame)
         
         if frames_to_read <= 0:
             self.cap.release()
@@ -836,8 +847,10 @@ def main():
     if args.end_frame > 0 or args.start_frame > 0:
         print(f"Input: {args.input} ({input_fps:.2f} FPS)")
         print(f"Processing frames: {reader.start_frame} to {reader.end_frame} (Total: {total_frames_to_process})")
-    else:
+    elif total_frames_to_process > 0:
         print(f"Input: {args.input} ({input_fps:.2f} FPS, {total_frames_to_process} frames)")
+    else:
+        print(f"Input: {args.input} ({input_fps:.2f} FPS, frame count unknown - reading to end of file)")
         
     # Use output FPS if specified, otherwise use input FPS
     output_fps = args.fps if args.fps is not None else input_fps
@@ -900,7 +913,7 @@ def main():
             elapsed = time.time() - start_time_glob
             
             # Speed (fps) - avoid division by zero
-            if total_processed > 0 and elapsed > 0:
+            if total_processed > 0 and elapsed > 0 and total_frames_to_process > 0:
                 speed_fps = total_processed / elapsed
                 remaining_frames = total_frames_to_process - total_processed
                 eta_seconds = remaining_frames / speed_fps
@@ -914,7 +927,8 @@ def main():
             # Print status for the *current state* (before processing this chunk)
             # format: Progress:   8.34% | Processed: 6464/77514 | Elapsed: 1:34:31 | ETA: 0:12:10 | Speed: 1.25 fps
             progress_pct = (total_processed / total_frames_to_process) * 100 if total_frames_to_process > 0 else 0
-            print(f"Progress: {progress_pct:6.2f}% | Processed: {total_processed}/{total_frames_to_process} | "
+            processed_text = f"{total_processed}/{total_frames_to_process}" if total_frames_to_process > 0 else f"{total_processed} (total unknown)"
+            print(f"Progress: {progress_pct:6.2f}% | Processed: {processed_text} | "
                   f"Elapsed: {formatted_elapsed} | ETA: {formatted_eta} | Speed: {speed_fps:.2f} fps")
             
             if stream_decode_enabled:
@@ -1065,7 +1079,7 @@ def main():
     
     print("\n" + "=" * 60)
     print("FlashVSR processing complete!")
-    print(f"Total Frames Processed: {total_processed}/{total_frames_to_process}")
+    print(f"Total Frames Processed: {total_processed}" + (f"/{total_frames_to_process}" if total_frames_to_process > 0 else ""))
     print(f"Total Time: {format_time(total_duration)} ({avg_fps:.2f} FPS)")
     print("=" * 60)
 

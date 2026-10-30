@@ -1384,6 +1384,24 @@ def process_chunk(
 
     return final_output[:frames.shape[0], :, :, :]
 
+
+def _next_oom_fallback(mode, tiled_vae, tiled_dit, tile_size, tile_overlap):
+    """Next lower-VRAM setting after an out-of-memory error (None when nothing is left).
+
+    Order: tile the DiT, then halve the tile size down to 128, then (tiny modes only) tile the
+    VAE. Tiled VAE is never enabled in full mode, where it corrupts colours. With the app's
+    Save VRAM cap an OOM is raised before Windows spills into shared GPU memory, so this keeps
+    the run going at a setting that fits instead of failing."""
+    if not tiled_dit:
+        return tiled_vae, True, max(128, min(int(tile_size), 512)), min(int(tile_overlap), 64), "Auto-enabling Tiled DiT"
+    if int(tile_size) > 128:
+        new_tile = max(128, int(tile_size) // 2)
+        return tiled_vae, True, new_tile, min(int(tile_overlap), max(8, new_tile // 4)), f"Reducing DiT tile size to {new_tile}"
+    if not tiled_vae and str(mode) != "full":
+        return True, True, tile_size, tile_overlap, "Auto-enabling Tiled VAE"
+    return None
+
+
 def flashvsr(
     pipe,
     frames,
@@ -1554,15 +1572,17 @@ def flashvsr(
 
             # Auto-Fallback Logic - FIX 5: Uses VRAM_OOM_THRESHOLD (95%)
             retry_count = 0
-            max_retries = 2
+            max_retries = 6
             current_tiled_vae = tiled_vae
             current_tiled_dit = tiled_dit
+            current_tile_size = tile_size
+            current_tile_overlap = tile_overlap
 
             while retry_count <= max_retries:
                 try:
                     chunk_out = process_chunk(
                         pipe, chunk_frames, scale, color_fix, current_tiled_vae, current_tiled_dit,
-                        tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio,
+                        current_tile_size, current_tile_overlap, unload_dit, sparse_ratio, kv_ratio,
                         local_range, seed, force_offload, enable_debug,
                         is_single_frame_input=is_single_frame_input,
                         stream_output_callback=stream_output_callback,
@@ -1586,30 +1606,29 @@ def flashvsr(
                         raise e
                     log(f"OOM detected in Chunk {i+1} (Attempt {retry_count}). Recovering...", message_type='warning', icon="ðŸ”„")
 
-                    if not current_tiled_vae:
-                        log("Auto-enabling Tiled VAE to prevent OOM (override)...", message_type='info', icon="ðŸ›¡ï¸")
-                        current_tiled_vae = True
-                    elif not current_tiled_dit:
-                        log("Auto-enabling Tiled DiT to prevent OOM (override)...", message_type='info', icon="ðŸ›¡ï¸")
-                        current_tiled_dit = True
-                    else:
-                        log("Both Tiled VAE and DiT enabled but still OOM. Cannot recover.", message_type='error', icon="âŒ")
-                        raise e # Cannot recover further
+                    fallback = _next_oom_fallback(mode, current_tiled_vae, current_tiled_dit, current_tile_size, current_tile_overlap)
+                    if fallback is None:
+                        log("Still out of memory at the smallest tiles. Cannot recover.", message_type='error', icon="X")
+                        raise e
+                    current_tiled_vae, current_tiled_dit, current_tile_size, current_tile_overlap, what = fallback
+                    log(f"{what} to stay inside the VRAM limit (no shared GPU memory)...", message_type='info', icon="!")
 
         if final_outputs:
             final_output_tensor = torch.cat(final_outputs, dim=0)
     else:
         # Auto-Fallback Logic for single chunk/full video
         retry_count = 0
-        max_retries = 2
+        max_retries = 6
         current_tiled_vae = tiled_vae
         current_tiled_dit = tiled_dit
+        current_tile_size = tile_size
+        current_tile_overlap = tile_overlap
 
         while retry_count <= max_retries:
             try:
                 final_output_tensor = process_chunk(
                     pipe, frames, scale, color_fix, current_tiled_vae, current_tiled_dit,
-                    tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio,
+                    current_tile_size, current_tile_overlap, unload_dit, sparse_ratio, kv_ratio,
                     local_range, seed, force_offload, enable_debug,
                     is_single_frame_input=is_single_frame_input,
                     stream_output_callback=stream_output_callback,
@@ -1629,15 +1648,12 @@ def flashvsr(
                     raise e
                 log(f"OOM detected (Attempt {retry_count}). Recovering...", message_type='warning', icon="ðŸ”„")
 
-                if not current_tiled_vae:
-                    log("Auto-enabling Tiled VAE to prevent OOM (override)...", message_type='info', icon="ðŸ›¡ï¸")
-                    current_tiled_vae = True
-                elif not current_tiled_dit:
-                    log("Auto-enabling Tiled DiT to prevent OOM (override)...", message_type='info', icon="ðŸ›¡ï¸")
-                    current_tiled_dit = True
-                else:
-                    log("Both Tiled VAE and DiT enabled but still OOM. Cannot recover.", message_type='error', icon="âŒ")
+                fallback = _next_oom_fallback(mode, current_tiled_vae, current_tiled_dit, current_tile_size, current_tile_overlap)
+                if fallback is None:
+                    log("Still out of memory at the smallest tiles. Cannot recover.", message_type='error', icon="X")
                     raise e
+                current_tiled_vae, current_tiled_dit, current_tile_size, current_tile_overlap, what = fallback
+                log(f"{what} to stay inside the VRAM limit (no shared GPU memory)...", message_type='info', icon="!")
 
     end_time = time.time()
     total_time = end_time - start_time

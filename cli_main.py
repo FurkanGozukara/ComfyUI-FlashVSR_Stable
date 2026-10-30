@@ -897,6 +897,7 @@ def main():
     writer = None
     total_processed = 0
     start_time_glob = 0
+    processing_error = None
     stream_decode_enabled = (args.mode in {"tiny", "tiny-long"}) and (not args.tiled_dit)
     if stream_decode_enabled:
         print("Streaming decode enabled: writing decoded frame groups incrementally for lower peak memory.")
@@ -1059,6 +1060,8 @@ def main():
         print(f"\nError during processing: {e}")
         import traceback
         traceback.print_exc()
+        # A run that stopped part-way must not look finished (the caller would keep a truncated video).
+        processing_error = e
     finally:
         if writer:
             print("[VideoWriter] finalize begin")
@@ -1076,7 +1079,13 @@ def main():
     end_time_glob = time.time()
     total_duration = end_time_glob - start_time_glob
     avg_fps = total_processed / total_duration if total_duration > 0 else 0
-    
+
+    if processing_error is not None:
+        is_oom = isinstance(processing_error, torch.OutOfMemoryError) or "out of memory" in str(processing_error).lower()
+        print(f"FlashVSR stopped after {total_processed} frame(s): "
+              + ("CUDA out of memory (VRAM limit reached)." if is_oom else f"{type(processing_error).__name__}: {processing_error}"))
+        sys.exit(3 if is_oom else 1)
+
     print("\n" + "=" * 60)
     print("FlashVSR processing complete!")
     print(f"Total Frames Processed: {total_processed}" + (f"/{total_frames_to_process}" if total_frames_to_process > 0 else ""))

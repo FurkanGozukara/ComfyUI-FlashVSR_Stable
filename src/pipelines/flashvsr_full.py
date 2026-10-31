@@ -411,8 +411,8 @@ class FlashVSRFullPipeline(BasePipeline):
         # low-quality frames with latents before decoding.
         # =======================================================================
         
-        # Load DiT for processing
-        self.load_models_to_device(["dit"])
+        # Load DiT for processing (and the VAE when it stream-decodes each step)
+        self.load_models_to_device(["dit", "vae"] if (self.TCDecoder is None and not tiled) else ["dit"])
         self.dit.LQ_proj_in.to(self.device)
         
         # TCDecoder is used for non-tiled decode path.

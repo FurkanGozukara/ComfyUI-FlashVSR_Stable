@@ -96,9 +96,10 @@ For more information, visit: https://github.com/naxci1/ComfyUI-FlashVSR_Stable
     parser.add_argument(
         '--vae_model',
         type=str,
-        choices=['Wan2.1', 'Wan2.2', 'LightVAE_W2.1', 'TAE_W2.2', 'LightTAE_HY1.5'],
+        choices=['Wan2.1', 'LightVAE_W2.1', 'Wan2.2', 'TAE_W2.2', 'LightTAE_HY1.5'],
         default='Wan2.1',
-        help='VAE model: Wan2.1 (default), Wan2.2, LightVAE_W2.1 (50%% less VRAM), TAE_W2.2, LightTAE_HY1.5. Auto-downloads if missing. (default: Wan2.1)'
+        help='Decoder VAE for --mode full: Wan2.1 (default) or LightVAE_W2.1 (smaller, faster). Tiny modes decode with '
+             'the TC decoder. Wan2.2 / TAE_W2.2 / LightTAE_HY1.5 cannot decode FlashVSR latents and fall back to Wan2.1.'
     )
     parser.add_argument(
         '--force_offload',
@@ -114,9 +115,17 @@ For more information, visit: https://github.com/naxci1/ComfyUI-FlashVSR_Stable
     parser.add_argument(
         '--precision',
         type=str,
-        choices=['fp16', 'bf16', 'auto'],
+        choices=['fp16', 'bf16', 'auto', 'int8_convrot'],
         default='auto',
-        help="Inference precision. 'auto' selects bf16 if supported (RTX 30/40/50 series), otherwise fp16. (default: auto)"
+        help="Inference precision. 'auto' selects bf16 if supported (RTX 30/40/50 series), otherwise fp16. "
+             "'int8_convrot' runs the DiT Linear layers as INT8 ConvRot from --int8_cache_dir (default: auto)"
+    )
+    parser.add_argument(
+        '--int8_cache_dir',
+        type=str,
+        default=None,
+        help="Folder holding <model>_int8_convrot.safetensors for --precision int8_convrot "
+             "(built there from the source checkpoint when missing). (default: the model folder)"
     )
     parser.add_argument(
         '--device',
@@ -863,8 +872,8 @@ def main():
     # Set attention mode
     wan_video_dit.ATTENTION_MODE = args.attention_mode
     
-    # Determine dtype
-    if args.precision == "auto":
+    # Determine dtype (INT8 ConvRot keeps its non-quantized layers and activations in bf16, else fp16)
+    if args.precision in ("auto", "int8_convrot"):
         if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
             dtype = torch.bfloat16
             print("Auto-detected bf16 support.")
@@ -886,7 +895,9 @@ def main():
         mode=args.mode,
         device=device,
         dtype=dtype,
-        vae_model=args.vae_model
+        vae_model=args.vae_model,
+        int8_cache_dir=(args.int8_cache_dir or os.path.join(os.path.dirname(os.path.abspath(__file__)), "models"))
+        if args.precision == "int8_convrot" else None,
     )
     
     # ==========================================================================
@@ -934,9 +945,10 @@ def main():
             
             if stream_decode_enabled:
                 streamed_any = False
+                streamed_count = 0
 
                 def on_stream_chunk(chunk_frames):
-                    nonlocal writer, streamed_any
+                    nonlocal writer, streamed_any, streamed_count
                     if chunk_frames is None:
                         return
                     if isinstance(chunk_frames, torch.Tensor) and chunk_frames.shape[0] <= 0:
@@ -962,8 +974,9 @@ def main():
 
                     writer.write(chunk_frames)
                     streamed_any = True
+                    streamed_count += int(chunk_frames.shape[0])
 
-                flashvsr(
+                returned_frames = flashvsr(
                     pipe=pipe,
                     frames=frames,
                     scale=args.scale,
@@ -986,6 +999,11 @@ def main():
                     mode=args.mode,
                     stream_output_callback=on_stream_chunk,
                 )
+                # An out-of-memory retry with DiT tiling returns the chunk instead of streaming it; write the
+                # frames that were not streamed before the retry.
+                if isinstance(returned_frames, torch.Tensor) and returned_frames.shape[0] > streamed_count:
+                    on_stream_chunk(returned_frames[streamed_count:])
+                del returned_frames
 
                 if not streamed_any:
                     raise RuntimeError("Streaming decode did not produce any output frames.")

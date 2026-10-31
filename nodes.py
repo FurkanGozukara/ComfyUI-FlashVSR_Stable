@@ -60,59 +60,52 @@ except ImportError:
 # =============================================================================
 # FIX 1: Unified VAE model selection dropdown - ALL 5 OPTIONS
 # =============================================================================
-VAE_MODEL_OPTIONS = ["Wan2.1", "Wan2.2", "LightVAE_W2.1", "TAE_W2.2", "LightTAE_HY1.5"]
+# Only VAEs whose decoder reads FlashVSR's 16-channel Wan2.1 latents. LightVAE_W2.1 is the same
+# network at width 24. Wan2.2 (48-channel latents) and the TAE / LightTAE files (other architectures
+# and latent spaces) cannot decode them; old settings that name them use Wan2.1.
+VAE_MODEL_OPTIONS = ["Wan2.1", "LightVAE_W2.1"]
+LEGACY_VAE_MODELS = {"Wan2.2": "Wan2.1", "TAE_W2.2": "Wan2.1", "LightTAE_HY1.5": "Wan2.1"}
 
-# =============================================================================
-# FIX 2 & 7: STRICT file path mapping with EXPLICIT class instantiation
-# Each VAE selection loads a DISTINCT file and uses EXPLICIT class (no guessing)
-# =============================================================================
 VAE_MODEL_MAP = {
     "Wan2.1": {
-        "class": WanVideoVAE, 
-        "file": "Wan2.1_VAE.pth", 
-        "internal_name": "wan2.1",
+        "class": WanVideoVAE,
+        "file": "Wan2.1_VAE.pth",
         "url": "https://huggingface.co/lightx2v/Autoencoders/resolve/main/Wan2.1_VAE.pth",
         "dim": VAE_FULL_DIM,
         "z_dim": VAE_Z_DIM,
-        "use_full_arch": False
-    },
-    "Wan2.2": {
-        "class": Wan22VideoVAE, 
-        "file": "Wan2.2_VAE.pth",
-        "internal_name": "wan2.2",
-        "url": "https://huggingface.co/lightx2v/Autoencoders/resolve/main/Wan2.2_VAE.pth",
-        "dim": VAE_FULL_DIM,
-        "z_dim": VAE_Z_DIM,
-        "use_full_arch": False
     },
     "LightVAE_W2.1": {
-        "class": LightX2VVAE, 
+        "class": WanVideoVAE,
         "file": "lightvaew2_1.pth",
-        "internal_name": "lightx2v",
         "url": "https://huggingface.co/lightx2v/Autoencoders/resolve/main/lightvaew2_1.pth",
-        "dim": VAE_LIGHT_DIM,
+        "dim": 24,
         "z_dim": VAE_Z_DIM,
-        "use_full_arch": True
-    },
-    "TAE_W2.2": {
-        "class": Wan22VideoVAE,  # TAE uses same base as Wan2.2
-        "file": "taew2_2.safetensors",
-        "internal_name": "tae_w2.2",
-        "url": "https://huggingface.co/lightx2v/Autoencoders/resolve/main/taew2_2.safetensors",
-        "dim": VAE_FULL_DIM,
-        "z_dim": VAE_Z_DIM,
-        "use_full_arch": False
-    },
-    "LightTAE_HY1.5": {
-        "class": LightX2VVAE,  # LightTAE uses LightX2V architecture
-        "file": "lighttaehy1_5.pth",
-        "internal_name": "lighttae_hy1.5",
-        "url": "https://huggingface.co/lightx2v/Autoencoders/resolve/main/lighttaehy1_5.pth",
-        "dim": VAE_LIGHT_DIM,
-        "z_dim": VAE_Z_DIM,
-        "use_full_arch": True
     },
 }
+
+
+def resolve_vae_model(vae_model):
+    name = str(vae_model or "Wan2.1")
+    if name in VAE_MODEL_MAP:
+        return name
+    replacement = LEGACY_VAE_MODELS.get(name, "Wan2.1")
+    log(f"VAE '{name}' cannot decode FlashVSR latents; using {replacement}.", message_type='warning')
+    return replacement
+
+
+def load_flashvsr_vae(vae_model, vae_path, device, dtype):
+    """Build the selected VAE and load every decoder weight (the .pth files have no 'model.' prefix)."""
+    cfg = VAE_MODEL_MAP[vae_model]
+    if vae_path.endswith(".safetensors"):
+        sd = safetensors.torch.load_file(vae_path)
+    else:
+        sd = torch.load(vae_path, map_location="cpu", weights_only=False)
+    if isinstance(sd, dict) and "model_state" in sd:
+        sd = sd["model_state"]
+    sd = {(k if k.startswith("model.") else "model." + k): v for k, v in sd.items()}
+    vae = cfg["class"](z_dim=cfg["z_dim"], dim=cfg["dim"])
+    vae.load_state_dict(sd, strict=True)
+    return vae.to(device=device, dtype=dtype)
 
 # =============================================================================
 # FIX 5: VRAM threshold for OOM recovery - set to 95%
@@ -894,23 +887,44 @@ def create_feather_mask(size, overlap):
     
     return mask
 
-def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1"):
+def _load_dit(mm, ckpt_path, model, int8_cache_dir, dtype):
+    """Load the DiT into the model manager: bf16/fp16 from the checkpoint, or INT8 ConvRot from its cache."""
+    if not int8_cache_dir:
+        if not os.path.exists(ckpt_path):
+            raise RuntimeError(f'"diffusion_pytorch_model_streaming_dmd.safetensors" does not exist!\nPlease save it to "{os.path.dirname(ckpt_path)}"')
+        mm.load_models([ckpt_path])
+        return
+    try:
+        from .src.models import int8_convrot_dit as int8_dit
+    except ImportError:
+        from src.models import int8_convrot_dit as int8_dit
+    cache = int8_dit.int8_cache_path(int8_cache_dir, model)
+    if int8_dit.has_valid_int8_cache(cache, ckpt_path):
+        dit = int8_dit.load_int8_dit(cache, dtype)
+        mm.model.append(dit)
+        mm.model_path.append(str(cache))
+        mm.model_name.append("wan_video_dit")
+        return
+    if not os.path.exists(ckpt_path):
+        raise RuntimeError(f"FlashVSR INT8 cache not found: {cache}\nDownload it with the model downloader, "
+                           f"or place the source checkpoint in {os.path.dirname(ckpt_path)} to build it.")
+    log(f"Building the FlashVSR INT8 ConvRot cache once: {cache}", message_type='info')
+    mm.load_models([ckpt_path])
+    dit = mm.fetch_model("wan_video_dit")
+    config = int8_dit.dit_model_config(dit)
+    int8_dit.quantize_dit_to_int8(dit, ckpt_path)
+    int8_dit.save_int8_dit(dit, cache, ckpt_path, config)
+    log(f"Saved FlashVSR INT8 cache: {cache}", message_type='finish')
+
+
+def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", int8_cache_dir=None):
     """
-    Initialize FlashVSR pipeline with specified model and VAE type.
-    
-    =============================================================================
-    FIX 2 & 7: STRICT VAE file path mapping with EXPLICIT class instantiation
-    =============================================================================
-    - vae_model: Unified VAE selection from dropdown (5 options)
-    - Each VAE selection loads a DISTINCT file (no file reuse)
-    - EXPLICIT class instantiation based on selection - NO guessing from state_dict
-    
-    File Mapping:
-    - "Wan2.1" -> Wan2.1_VAE.pth -> WanVideoVAE
-    - "Wan2.2" -> Wan2.2_VAE.pth -> Wan22VideoVAE
-    - "LightVAE_W2.1" -> lightvaew2_1.pth -> LightX2VVAE
-    - "TAE_W2.2" -> taew2_2.safetensors -> Wan22VideoVAE
-    - "LightTAE_HY1.5" -> lighttaehy1_5.pth -> LightX2VVAE
+    Initialize the FlashVSR pipeline.
+
+    - mode "full" decodes with the selected VAE (Wan2.1_VAE.pth or lightvaew2_1.pth, see VAE_MODEL_MAP);
+      "tiny" / "tiny-long" decode with the TC decoder and load no VAE.
+    - int8_cache_dir: run the DiT Linear layers as INT8 ConvRot from <int8_cache_dir>/<model>_int8_convrot.safetensors
+      (built there from the source checkpoint when missing).
     """
     model_download(model_name="JunhaoZhuang/"+model)
     base_dir = get_flashvsr_model_base_dir()
@@ -918,103 +932,29 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1"):
     if not os.path.exists(model_path):
         raise RuntimeError(f'Model directory does not exist!\nPlease save all weights to "{model_path}"')
     ckpt_path = os.path.join(model_path, "diffusion_pytorch_model_streaming_dmd.safetensors")
-    if not os.path.exists(ckpt_path):
-        raise RuntimeError(f'"diffusion_pytorch_model_streaming_dmd.safetensors" does not exist!\nPlease save it to "{model_path}"')
-    
-    # ==========================================================================
-    # FIX 2 & 7: VAE Model Loading - EXPLICIT mapping (no guessing!)
-    # ==========================================================================
-    if vae_model not in VAE_MODEL_MAP:
-        log(f"Unknown VAE model '{vae_model}', defaulting to Wan2.1", message_type='warning', icon="âš ï¸")
-        vae_model = "Wan2.1"
-    
-    vae_config = VAE_MODEL_MAP[vae_model]
-    vae_class = vae_config["class"]
-    vae_file = vae_config["file"]
-    vae_dim = vae_config["dim"]
-    vae_z_dim = vae_config["z_dim"]
-    use_full_arch = vae_config["use_full_arch"]
-    
-    # Debug logging - Show EXACTLY which file and class will be used
-    log(f"VAE Selection: '{vae_model}' -> File: '{vae_file}' -> Class: {vae_class.__name__}", 
-        message_type='info', icon="ðŸ”")
-    
-    # ==========================================================================
-    # FIX 6: Auto-download VAE if missing
-    # ==========================================================================
-    vae_path = download_vae_if_missing(vae_file, model_path, vae_config)
-    
-    log(f"VAE file path confirmed: {vae_path}", message_type='info', icon="ðŸ“")
-    
     lq_path = os.path.join(model_path, "LQ_proj_in.ckpt")
     if not os.path.exists(lq_path):
         raise RuntimeError(f'"LQ_proj_in.ckpt" does not exist!\nPlease save it to "{model_path}"')
-    tcd_path = os.path.join(model_path, "TCDecoder.ckpt")
-    if not os.path.exists(tcd_path):
-        raise RuntimeError(f'"TCDecoder.ckpt" does not exist!\nPlease save it to "{model_path}"')
     current_dir = os.path.dirname(os.path.abspath(__file__))
     prompt_path = os.path.join(current_dir, "posi_prompt.pth")
-    
+
     mm = ModelManager(torch_dtype=dtype, device="cpu")
+    _load_dit(mm, ckpt_path, model, int8_cache_dir, dtype)
     if mode == "full":
-        mm.load_models([ckpt_path, vae_path])
+        # Full mode decodes with the Wan VAE, as upstream FlashVSR does; tiny modes use the TC decoder.
+        vae_model = resolve_vae_model(vae_model)
+        vae_config = VAE_MODEL_MAP[vae_model]
+        vae_path = download_vae_if_missing(vae_config["file"], model_path, vae_config)
         pipe = FlashVSRFullPipeline.from_model_manager(mm, device=device)
-
-        # =======================================================================
-        # FIX 7: EXPLICIT VAE class instantiation - NO guessing from state_dict
-        # =======================================================================
-        log(f"Creating EXPLICIT VAE instance: {vae_class.__name__} (dim={vae_dim}, z_dim={vae_z_dim})", 
-            message_type='info', icon="ðŸ“¦")
-        
-        # Load weights from file
-        if vae_path.endswith(".safetensors"):
-            try:
-                import safetensors.torch
-                sd = safetensors.torch.load_file(vae_path)
-            except ImportError:
-                raise RuntimeError("safetensors library required to load .safetensors VAE file.")
-        else:
-            sd = torch.load(vae_path, map_location="cpu", weights_only=False)
-        
-        # EXPLICIT class instantiation based on user selection (FIX 7)
-        # NO state_dict inspection - we trust the user's selection
-        if vae_class == LightX2VVAE:
-            pipe.vae = LightX2VVAE(z_dim=vae_z_dim, dim=vae_dim, use_full_arch=use_full_arch)
-        elif vae_class == Wan22VideoVAE:
-            pipe.vae = Wan22VideoVAE(z_dim=vae_z_dim, dim=vae_dim)
-        else:  # WanVideoVAE (default)
-            pipe.vae = WanVideoVAE(z_dim=vae_z_dim, dim=vae_dim)
-        
-        # Load state dict with logging for missing/unexpected keys
-        load_result = pipe.vae.load_state_dict(sd, strict=False)
-        if load_result.missing_keys:
-            log(f"VAE missing keys: {len(load_result.missing_keys)} (expected for Light* models)", 
-                message_type='info', icon="â„¹ï¸")
-        if load_result.unexpected_keys:
-            log(f"VAE unexpected keys: {len(load_result.unexpected_keys)}", 
-                message_type='info', icon="â„¹ï¸")
-        
-        pipe.vae = pipe.vae.to(device=device, dtype=dtype)
-        
-        log(f"Loaded VAE weights from: {vae_path}", message_type='info', icon="âœ…")
-        log(f"VAE Type Active: {type(pipe.vae).__name__}", message_type='info', icon="ðŸ“¦")
-
+        pipe.vae = load_flashvsr_vae(vae_model, vae_path, device, dtype)
         pipe.vae.model.encoder = None
         pipe.vae.model.conv1 = None
-        
-        # =======================================================================
-        # FIX: Load TCDecoder for Full Mode (official FlashVSR approach)
-        # The official FlashVSR uses TCDecoder for all modes with LQ conditioning.
-        # This is critical because TCDecoder.decode_video() takes a `cond` parameter
-        # that enables proper video super-resolution with low-quality guidance.
-        # =======================================================================
-        multi_scale_channels = [512, 256, 128, 128]
-        pipe.TCDecoder = build_tcdecoder(new_channels=multi_scale_channels, device=device, dtype=dtype, new_latent_channels=16+768)
-        mis = pipe.TCDecoder.load_state_dict(torch.load(tcd_path, map_location=device, weights_only=False), strict=False)
-        pipe.TCDecoder.clean_mem()
-        log(f"Loaded TCDecoder for Full Mode (official FlashVSR approach)", message_type='info', icon="âœ…")
+        pipe.TCDecoder = None
+        log(f"Full mode decoder: {vae_model} VAE ({vae_config['file']})", message_type='info')
     else:
-        mm.load_models([ckpt_path])
+        tcd_path = os.path.join(model_path, "TCDecoder.ckpt")
+        if not os.path.exists(tcd_path):
+            raise RuntimeError(f'"TCDecoder.ckpt" does not exist!\nPlease save it to "{model_path}"')
         if mode == "tiny":
             pipe = FlashVSRTinyPipeline.from_model_manager(mm, device=device)
         else:
@@ -1023,7 +963,8 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1"):
         pipe.TCDecoder = build_tcdecoder(new_channels=multi_scale_channels, device=device, dtype=dtype, new_latent_channels=16+768)
         mis = pipe.TCDecoder.load_state_dict(torch.load(tcd_path, map_location=device, weights_only=False), strict=False)
         pipe.TCDecoder.clean_mem()
-    
+        vae_model = "TC decoder"
+
     if model == "FlashVSR":
         pipe.denoising_model().LQ_proj_in = Buffer_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1).to(device, dtype=dtype)
     else:
@@ -1032,14 +973,18 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1"):
     pipe.denoising_model().LQ_proj_in.to(device)
     pipe.to(device, dtype=dtype)
     pipe.enable_vram_management(num_persistent_param_in_dit=None)
+    try:
+        from .src.models.int8_convrot_dit import count_int8_linears, set_int8_onload_device
+    except ImportError:
+        from src.models.int8_convrot_dit import count_int8_linears, set_int8_onload_device
+    if count_int8_linears(pipe.dit):
+        set_int8_onload_device(pipe.dit, device)
     pipe.init_cross_kv(prompt_path=prompt_path)
     pipe.load_models_to_device(["dit","vae"])
     pipe.offload_model()
 
     # Log final pipeline info with VAE confirmation
-    vae_info = f"VAE Model: {vae_model}"
-    if hasattr(pipe, 'vae') and pipe.vae is not None:
-        vae_info += f" ({type(pipe.vae).__name__})"
+    vae_info = f"Decoder: {vae_model}"
     
     log(f"Pipeline Initialized: Mode={mode}, Device={device}, Dtype={dtype}, Attention={wan_video_dit.ATTENTION_MODE}", message_type='info', icon="ðŸ”§")
     log(f"Model: {model}, {vae_info}", message_type='info', icon="ðŸ“¦")
@@ -1388,16 +1333,16 @@ def process_chunk(
 def _next_oom_fallback(mode, tiled_vae, tiled_dit, tile_size, tile_overlap):
     """Next lower-VRAM setting after an out-of-memory error (None when nothing is left).
 
-    Order: tile the DiT, then halve the tile size down to 128, then (tiny modes only) tile the
-    VAE. Tiled VAE is never enabled in full mode, where it corrupts colours. With the app's
-    Save VRAM cap an OOM is raised before Windows spills into shared GPU memory, so this keeps
-    the run going at a setting that fits instead of failing."""
+    Order: tile the DiT, then halve the tile size down to 128, then tile the decoder (the VAE in
+    full mode, the TC decoder in tiny modes). With the app's Save VRAM cap an OOM is raised before
+    Windows spills into shared GPU memory, so this keeps the run going at a setting that fits
+    instead of failing."""
     if not tiled_dit:
         return tiled_vae, True, max(128, min(int(tile_size), 512)), min(int(tile_overlap), 64), "Auto-enabling Tiled DiT"
     if int(tile_size) > 128:
         new_tile = max(128, int(tile_size) // 2)
         return tiled_vae, True, new_tile, min(int(tile_overlap), max(8, new_tile // 4)), f"Reducing DiT tile size to {new_tile}"
-    if not tiled_vae and str(mode) != "full":
+    if not tiled_vae:
         return True, True, tile_size, tile_overlap, "Auto-enabling Tiled VAE"
     return None
 

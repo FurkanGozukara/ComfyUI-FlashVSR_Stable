@@ -40,7 +40,7 @@ PLUS_MODELS = {
     "FlashVSR-v1.1-Plus-Runtime": "v1",
 }
 MULTIPLE = 128
-INT8_PLUS_FORMAT = "flashvsr-plus-dit-int8-convrot-v1"
+INT8_PLUS_FORMAT = "flashvsr-plus-dit-int8-convrot-v2"  # v2: no ARA branch (v1 caches are rebuilt once)
 READ_CHUNK_FRAMES = 16
 
 
@@ -162,7 +162,10 @@ def build_int8_cache(config, paths: Dict[str, Path], cache: Path, preset: str) -
 
     _log(f"[FlashVSR+ INT8] Building the INT8 ConvRot cache once: {cache}")
     model = build_denoiser(config, paths, torch.bfloat16)
-    quantize_dit_to_int8(model, paths["dit"])
+    # No ARA low-rank branch: on FlashVSR+ it scored the same (Turbo robot 1080p 37.248 vs 37.245 dB, ski 32.816 vs
+    # 32.813 dB against the originals) and its two extra passes per layer made INT8 no faster than BF16 (11.0 vs 11.4 s).
+    rank = os.environ.get("SECOURSES_INT8_LOWRANK_RANK", "").strip()
+    quantize_dit_to_int8(model, paths["dit"], lowrank_rank=int(rank) if rank.isdigit() else 0)
     state = {k: v.detach().cpu().contiguous() for k, v in model.state_dict().items() if not k.startswith("LQ_proj_in.")}
     quantized = 0
     for name, module in model.named_modules():

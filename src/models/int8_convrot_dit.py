@@ -176,11 +176,16 @@ def load_int8_dit(cache_path: str | Path, dtype: torch.dtype) -> nn.Module:
     return model
 
 
-def quantize_dit_to_int8(dit: nn.Module, source_checkpoint: str | Path) -> int:
-    """Convert the eligible Linear layers of a loaded DiT in place (one-time cache build)."""
+def quantize_dit_to_int8(dit: nn.Module, source_checkpoint: str | Path, lowrank_rank: Optional[int] = None) -> int:
+    """Convert the eligible Linear layers of a loaded DiT in place (one-time cache build).
+
+    lowrank_rank overrides the ARA rank (None = the engine default / SECOURSES_INT8_LOWRANK_RANK)."""
     from .int8_convert_engine import Int8ConversionEngine
 
     engine = Int8ConversionEngine(source_checkpoint, log_prefix="[FlashVSR INT8]")
+    if lowrank_rank is not None:
+        engine.lowrank_rank = max(0, int(lowrank_rank))
+        engine.report.features["lowrank_rank"] = engine.lowrank_rank
     candidates: Dict[str, nn.Linear] = {}
     for name, module in dit.named_modules():
         if isinstance(module, nn.Linear) and module.weight.ndim == 2 and module.weight.device.type != "meta":

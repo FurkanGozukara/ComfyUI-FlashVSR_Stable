@@ -111,6 +111,8 @@ def load_flashvsr_vae(vae_model, vae_path, device, dtype):
 # FIX 5: VRAM threshold for OOM recovery - set to 95%
 # =============================================================================
 VRAM_OOM_THRESHOLD = 0.95  # Only trigger OOM recovery when 95% VRAM is used
+TAIL_PAD_MIN = 0  # minimum padded tail frames per chunk (0 = original 4-11)
+TC_CHANNELS_LAST = False  # channels-last TC decoder convolutions (tiny modes)
 
 # =============================================================================
 # Model Paths Configuration Loader
@@ -865,7 +867,11 @@ def calculate_vae_tiler_kwargs(tile_size_px: int, tile_overlap_px: int, latent_h
         "tile_stride": (stride_h, stride_w),
     }
 
-def create_feather_mask(size, overlap):
+def create_feather_mask(size, overlap, edges=(True, True, True, True)):
+    """Blend weights for one DiT tile: linear ramps over `overlap` px on the edges that meet another tile.
+
+    edges = (left, right, top, bottom): True where a neighbouring tile overlaps. Edges on the image border
+    keep weight 1; a ramp there starts at 0 and, with no other tile covering it, left a black 1-px border."""
     H, W = size
     H = int(H)
     W = int(W)
@@ -878,13 +884,19 @@ def create_feather_mask(size, overlap):
         return mask
 
     ramp = torch.linspace(0, 1, overlap, dtype=mask.dtype, device=mask.device)
-    
-    mask[:, :, :, :overlap] = torch.minimum(mask[:, :, :, :overlap], ramp.view(1, 1, 1, -1))
-    mask[:, :, :, -overlap:] = torch.minimum(mask[:, :, :, -overlap:], ramp.flip(0).view(1, 1, 1, -1))
-    
-    mask[:, :, :overlap, :] = torch.minimum(mask[:, :, :overlap, :], ramp.view(1, 1, -1, 1))
-    mask[:, :, -overlap:, :] = torch.minimum(mask[:, :, -overlap:, :], ramp.flip(0).view(1, 1, -1, 1))
-    
+    if os.environ.get("FLASHVSR_FEATHER_LEGACY", "").strip() == "1":  # A/B switch: pre-fix behaviour
+        edges = (True, True, True, True)
+    left, right, top, bottom = (bool(e) for e in edges)
+
+    if left:
+        mask[:, :, :, :overlap] = torch.minimum(mask[:, :, :, :overlap], ramp.view(1, 1, 1, -1))
+    if right:
+        mask[:, :, :, -overlap:] = torch.minimum(mask[:, :, :, -overlap:], ramp.flip(0).view(1, 1, 1, -1))
+    if top:
+        mask[:, :, :overlap, :] = torch.minimum(mask[:, :, :overlap, :], ramp.view(1, 1, -1, 1))
+    if bottom:
+        mask[:, :, -overlap:, :] = torch.minimum(mask[:, :, -overlap:, :], ramp.flip(0).view(1, 1, -1, 1))
+
     return mask
 
 def _load_dit(mm, ckpt_path, model, int8_cache_dir, dtype):
@@ -963,6 +975,9 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", int8_cache_dir
         pipe.TCDecoder = build_tcdecoder(new_channels=multi_scale_channels, device=device, dtype=dtype, new_latent_channels=16+768)
         mis = pipe.TCDecoder.load_state_dict(torch.load(tcd_path, map_location=device, weights_only=False), strict=False)
         pipe.TCDecoder.clean_mem()
+        if TC_CHANNELS_LAST and dtype in (torch.float16, torch.bfloat16):
+            pipe.TCDecoder.to(memory_format=torch.channels_last)
+            pipe.TCDecoder.use_channels_last = True
         vae_model = "TC decoder"
 
     if model == "FlashVSR":
@@ -1128,7 +1143,9 @@ def process_chunk(
     target_H, target_W = original_H * scale, original_W * scale
     
     # Padding logic for the chunk (temporal padding)
-    add = next_8n5(frames.shape[0]) - frames.shape[0]
+    # The chunk is padded with copies of its last frame to 8n+5 frames, plus 4 more in prepare_input_tensor:
+    # 4 to 11 padded frames. TAIL_PAD_MIN > 4 guarantees at least that many (more context for the last frames).
+    add = next_8n5(frames.shape[0] + max(0, int(TAIL_PAD_MIN) - 4)) - frames.shape[0]
     padding_frames = frames[-1:, :, :, :].repeat(add, 1, 1, 1)
     _frames = torch.cat([frames, padding_frames], dim=0)
 
@@ -1204,7 +1221,8 @@ def process_chunk(
             
             mask_nchw = create_feather_mask(
                 (processed_tile_cpu.shape[1], processed_tile_cpu.shape[2]),
-                tile_overlap * scale
+                tile_overlap * scale,
+                edges=(x1 > 0, x2 < W, y1 > 0, y2 < H),
             ).to("cpu")
             mask_nhwc = mask_nchw.permute(0, 2, 3, 1)
             out_x1, out_y1 = x1 * scale, y1 * scale

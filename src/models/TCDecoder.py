@@ -92,7 +92,7 @@ class PixelShuffle3d(nn.Module):
 # Generic NTCHW graph executor (kept; used by decoder)
 # ----------------------------
 
-def apply_model_with_memblocks(model, x, parallel, show_progress_bar, mem=None):
+def apply_model_with_memblocks(model, x, parallel, show_progress_bar, mem=None, channels_last=False):
     """
     Apply a sequential model with memblocks to the given input.
     Args:
@@ -122,7 +122,11 @@ def apply_model_with_memblocks(model, x, parallel, show_progress_bar, mem=None):
         x = x.view(N, T, C, H, W)
     else:
         out = []
-        work_queue = [TWorkItem(xt, 0) for t, xt in enumerate(x.reshape(N, T * C, H, W).chunk(T, dim=1))]
+        frames_in = x.reshape(N, T * C, H, W).chunk(T, dim=1)
+        if channels_last:
+            # NHWC storage for the BF16 convolutions (layout only; FlashVSR+ decoder does the same).
+            frames_in = [f.contiguous(memory_format=torch.channels_last) for f in frames_in]
+        work_queue = [TWorkItem(xt, 0) for t, xt in enumerate(frames_in)]
         progress_bar = tqdm(range(T), disable=not show_progress_bar)
         while work_queue:
             xt, i = work_queue.pop(0)
@@ -267,7 +271,8 @@ class TAEHV(nn.Module):
         if cond is not None:
             x = torch.cat([self.pixel_shuffle(cond), x], dim=2)
 
-        x, mem = apply_model_with_memblocks(self.decoder, x, parallel, show_progress_bar, mem=mem)
+        x, mem = apply_model_with_memblocks(self.decoder, x, parallel, show_progress_bar, mem=mem,
+                                            channels_last=getattr(self, "use_channels_last", False))
         
         # If we used internal memory, update it
         if not using_external_mem:

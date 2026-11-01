@@ -82,9 +82,68 @@ For more information, visit: https://github.com/naxci1/ComfyUI-FlashVSR_Stable
     parser.add_argument(
         '--model',
         type=str,
-        choices=['FlashVSR', 'FlashVSR-v1.1'],
+        choices=['FlashVSR', 'FlashVSR-v1.1', 'FlashVSR-Plus-Turbo', 'FlashVSR-Plus-Base', 'FlashVSR-v1.1-Plus-Runtime'],
         default='FlashVSR-v1.1',
-        help='FlashVSR model version. V1.1 is recommended for better stability. (default: FlashVSR-v1.1)'
+        help='FlashVSR model version. V1.1 is recommended for better stability. FlashVSR-Plus-Turbo / FlashVSR-Plus-Base '
+             'run the official FlashVSR+ engine (one stream over the whole clip, TC decoder). (default: FlashVSR-v1.1)'
+    )
+    parser.add_argument(
+        '--tail_pad_min',
+        type=int,
+        default=0,
+        help='FlashVSR v1.0/v1.1: minimum padded tail frames per chunk (0 = original 4-11 frames).'
+    )
+    parser.add_argument(
+        '--tc_channels_last',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='FlashVSR v1.0/v1.1 tiny modes: channels-last TC decoder convolutions (same output, about 1 GB lower peak at 1080p). (default: on)'
+    )
+    # FlashVSR+ engine options (ignored by FlashVSR v1.0 / v1.1)
+    parser.add_argument(
+        '--temporal_compression',
+        type=int,
+        choices=[1, 2, 4],
+        default=4,
+        help='FlashVSR+: input frames per latent frame. 4 = default; 2 or 1 keep more detail in large motion '
+             '(about 2x / 4x the work). (default: 4)'
+    )
+    parser.add_argument(
+        '--decode_every',
+        type=int,
+        default=16,
+        help='FlashVSR+: latent frames per decode/write segment (multiple of 4). Smaller = less RAM/VRAM for the '
+             'decoder, more segments. (default: 16)'
+    )
+    parser.add_argument(
+        '--plus_kv_offload',
+        type=str,
+        choices=['auto', 'never', 'always'],
+        default='auto',
+        help='FlashVSR+: keep the KV cache of the full-attention layers in pinned RAM between stream steps. '
+             '(default: auto)'
+    )
+    parser.add_argument(
+        '--plus_tiny_decoder',
+        type=str,
+        choices=['auto', 'serial', 'parallel'],
+        default='serial',
+        help='FlashVSR+: TC decoder execution. Serial gives the same frames as parallel and was as fast on an RTX 5090 '
+             'while parallel needed about 11 GB more at 720p. (default: serial)'
+    )
+    parser.add_argument(
+        '--plus_channels_last',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='FlashVSR+: channels-last TC decoder convolutions. (default: on)'
+    )
+    parser.add_argument(
+        '--ffn_chunk_tokens',
+        type=int,
+        default=None,
+        help='FFN token chunk size (0 = auto: on above 65536 tokens per step, i.e. about 4K; -1 = off). Same '
+             'math in token slabs (GEMM rounding differs slightly), lower peak VRAM. (default: auto for FlashVSR+, '
+             'off for v1.0/v1.1)'
     )
     parser.add_argument(
         '--mode',
@@ -136,7 +195,7 @@ For more information, visit: https://github.com/naxci1/ComfyUI-FlashVSR_Stable
     parser.add_argument(
         '--attention_mode',
         type=str,
-        choices=['sparse_sage_attention', 'block_sparse_attention', 'flash_attention_2', 'sdpa'],
+        choices=['sparse_sage_attention', 'block_sparse_attention', 'triton_block_sparse_attention', 'flash_attention_2', 'sdpa'],
         default='sparse_sage_attention',
         help='Attention mechanism backend. "sparse_sage"/"block_sparse" use efficient sparse attention. "flash_attention_2"/"sdpa" use dense attention. (default: sparse_sage_attention)'
     )
@@ -611,9 +670,13 @@ class VideoWriter:
         else:
             frames_np = frames_tensor
         
-        # Ensure values are in [0, 1] and convert to uint8
+        # Ensure values are in [0, 1] and convert to uint8, rounding to the nearest level (a plain cast
+        # truncates, which made every frame about half a level darker; FLASHVSR_WRITER_TRUNCATE=1 = old).
         frames_np = np.clip(frames_np, 0.0, 1.0)
-        frames_np = (frames_np * 255).astype(np.uint8)
+        if os.environ.get("FLASHVSR_WRITER_TRUNCATE", "").strip() == "1":
+            frames_np = (frames_np * 255).astype(np.uint8)
+        else:
+            frames_np = (frames_np * 255.0 + 0.5).astype(np.uint8)
         
         n_frames = frames_np.shape[0]
         
@@ -829,7 +892,29 @@ def main():
             device = "cpu"
     
     print(f"Device: {device}")
-    
+
+    from plus_runtime import is_plus_model, run_plus
+    if is_plus_model(args.model):
+        # Official FlashVSR+ engine: one stream over the whole clip, written segment by segment.
+        args.device = device
+        args.color_fix_effective = color_fix
+        args.keep_on_gpu = not effective_force_offload
+        probe = VideoReader(args.input, start_frame=args.start_frame, end_frame=args.end_frame, chunk_size=1)
+        input_fps, file_total_frames = probe.get_info()
+        probe.cap.release()
+        total = max(0, probe.end_frame - probe.start_frame)
+        output_fps = args.fps if args.fps is not None else input_fps
+        print(f"Input: {args.input} ({input_fps:.2f} FPS, {total} frames)")
+
+        def make_writer(w, h):
+            return VideoWriter(
+                output_path=args.output, fps=output_fps, width=w, height=h, codec=args.codec, crf=args.crf,
+                video_preset=args.video_preset, pixel_format=args.pixel_format, h265_tune=args.h265_tune,
+                av1_film_grain=args.av1_film_grain, av1_film_grain_denoise=args.av1_film_grain_denoise,
+            )
+
+        sys.exit(run_plus(args, VideoReader, make_writer, output_fps, total))
+
     # Import FlashVSR modules after mocking
     from nodes import (
         init_pipeline, flashvsr, log,
@@ -871,6 +956,10 @@ def main():
     
     # Set attention mode
     wan_video_dit.ATTENTION_MODE = args.attention_mode
+    wan_video_dit.FFN_CHUNK_TOKENS = -1 if args.ffn_chunk_tokens is None else int(args.ffn_chunk_tokens)
+    import nodes as _nodes_module
+    _nodes_module.TAIL_PAD_MIN = max(0, int(args.tail_pad_min))
+    _nodes_module.TC_CHANNELS_LAST = bool(args.tc_channels_last)
     
     # Determine dtype (INT8 ConvRot keeps its non-quantized layers and activations in bf16, else fp16)
     if args.precision in ("auto", "int8_convrot"):

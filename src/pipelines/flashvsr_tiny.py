@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 from ..models import ModelManager
 from ..models.utils import clean_vram
-from ..models.wan_video_dit import WanModel, RMSNorm, sinusoidal_embedding_1d
+from ..models.wan_video_dit import WanModel, RMSNorm, sinusoidal_embedding_1d, ensure_rope_length
 from ..models.wan_video_vae import WanVideoVAE, RMS_norm, CausalConv3d, Upsample
 from ..schedulers.flow_match import FlowMatchScheduler
 from .base import BasePipeline
@@ -460,6 +460,11 @@ class FlashVSRTinyPipeline(BasePipeline):
             noise = self.generate_noise((1, 16, (num_frames - 1) // 4 + 1, height//8, width//8), seed=seed, device=self.device, dtype=self.torch_dtype)
         # noise = noise.to(dtype=self.torch_dtype, device=self.device)
         latents = noise
+        if os.environ.get("FLASHVSR_NOISE_ON_GPU", "").strip().lower() not in {"1", "true", "yes", "on"}:
+            # Same values (drawn on the GPU as before), but the whole-clip noise lives in RAM and each
+            # stream step copies only its 2-6 latent frames (about 1 GB of VRAM at 1080p, 4 GB at 4K, 4000 frames).
+            latents = latents.to("cpu")
+            del noise
 
         process_total_num = (num_frames - 8 - 1) // 8 + 1 # Adjusted logic from tiny-long or similar
         # tiny logic was: (num_frames - 1) // 8 - 2
@@ -506,7 +511,7 @@ class FlashVSRTinyPipeline(BasePipeline):
                             for layer_idx in range(len(LQ_latents)):
                                 LQ_latents[layer_idx] = torch.cat([LQ_latents[layer_idx], cur[layer_idx]], dim=1)
                     LQ_cur_idx = (inner_loop_num-1)*4-3
-                    cur_latents = latents[:, :, :6, :, :]
+                    cur_latents = latents[:, :, :6, :, :].to(self.device)
                 else:
                     LQ_latents = None
                     inner_loop_num = 2
@@ -522,7 +527,7 @@ class FlashVSRTinyPipeline(BasePipeline):
                             for layer_idx in range(len(LQ_latents)):
                                 LQ_latents[layer_idx] = torch.cat([LQ_latents[layer_idx], cur[layer_idx]], dim=1)
                     LQ_cur_idx = cur_process_idx*8+21+(inner_loop_num-2)*4
-                    cur_latents = latents[:, :, 4+cur_process_idx*2:6+cur_process_idx*2, :, :]
+                    cur_latents = latents[:, :, 4+cur_process_idx*2:6+cur_process_idx*2, :, :].to(self.device)
 
                 # 推理（无 motion_controller / vace）
                 noise_pred_posi, pre_cache_k, pre_cache_v = model_fn_wan_video(
@@ -783,6 +788,7 @@ def model_fn_wan_video(
             dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
         ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
     else:
+        ensure_rope_length(dit, 4 + cur_process_idx*2 + f)
         freqs = torch.cat([
             dit.freqs[0][4 + cur_process_idx*2:4 + cur_process_idx*2 + f].view(f, 1, 1, -1).expand(f, h, w, -1),
             dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),

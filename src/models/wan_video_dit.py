@@ -52,6 +52,8 @@ def _resolve_attention_mode() -> str:
         "flash_attn_2": "flash_attention_2",
         "flash_attention_2": "flash_attention_2",
         "sdpa": "sdpa",
+        "triton_block_sparse": "triton_block_sparse_attention",
+        "triton_block_sparse_attention": "triton_block_sparse_attention",
     }
     return alias.get(raw, "sparse_sage_attention")
 
@@ -250,6 +252,17 @@ def generate_draft_block_mask_sage(batch_size, nheads, seqlen,
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, compatibility_mode=False, attention_mask=None, return_KV=False):
     mode = _resolve_attention_mode()
 
+    if attention_mask is not None and mode == "triton_block_sparse_attention":
+        # Exact block-sparse attention in BF16 (the FlashVSR+ Triton kernel) over the same 128-token
+        # windows and draft mask that block_sparse_attn uses; no INT8 quantization of Q/K like Sage.
+        from flashvsr_plus_engine.flashvsr_attn import stream_block_sparse_attention
+
+        qw = rearrange(q, "b (nb s) (h d) -> b h nb s d", s=128, h=num_heads)
+        kw = rearrange(k, "b (nb s) (h d) -> b h nb s d", s=128, h=num_heads)
+        vw = rearrange(v, "b (nb s) (h d) -> b h nb s d", s=128, h=num_heads)
+        x = stream_block_sparse_attention(qw, kw, vw, attention_mask.bool(), ensure_nonempty=True)
+        return rearrange(x, "b h nb s d -> b (nb s) (h d)")
+
     # Sparse paths require the draft mask built by FlashVSR's local sparse logic.
     if attention_mask is not None and mode in {"sparse_sage_attention", "block_sparse_attention"}:
         seqlen = q.shape[1]
@@ -384,8 +397,44 @@ def precompute_freqs_cis(dim: int, end: int = 1024, theta: float = 10000.0):
     return freqs_cis
 
 
+# FFN token chunking: 0 = auto (chunks of 32768 tokens above 65536 tokens per step), -1 = off, >0 = chunk size.
+FFN_CHUNK_TOKENS = -1  # off by default: no measured gain for v1.1 (its 4K runs are tiled)
+FFN_AUTO_THRESHOLD = 65536
+FFN_AUTO_CHUNK = 32768
+
+
+def ffn_chunk_tokens(tokens: int) -> int:
+    setting = int(FFN_CHUNK_TOKENS or 0)
+    if setting < 0:
+        return 0
+    if setting > 0:
+        return setting if tokens > setting else 0
+    return FFN_AUTO_CHUNK if tokens > FFN_AUTO_THRESHOLD else 0
+
+
+def ensure_rope_length(dit, length: int) -> None:
+    """Grow the temporal RoPE table when a pass needs more than its 1024 latent positions.
+
+    The table is a pure function of the position, so existing rows are unchanged; without this a pass of
+    more than about 4,090 frames indexed past the table and crashed."""
+    table = dit.freqs[0]
+    if table.shape[0] >= length:
+        return
+    new_len = max(int(length), 2 * table.shape[0])
+    grown = precompute_freqs_cis(table.shape[1] * 2, new_len).to(table.device)
+    dit.freqs = (grown, dit.freqs[1], dit.freqs[2])
+
+
+ROPE_FP32 = os.environ.get("FLASHVSR_ROPE_FP32", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def rope_apply(x, freqs, num_heads):
     x = rearrange(x, "b s (n d) -> b s n d", n=num_heads)
+    if ROPE_FP32:
+        # Comparison path: complex64 instead of complex128 (FP64 runs at a small fraction of FP32 speed on GeForce).
+        x_out = torch.view_as_complex(x.float().reshape(x.shape[0], x.shape[1], x.shape[2], -1, 2).contiguous())
+        x_out = torch.view_as_real(x_out * freqs.to(torch.complex64)).flatten(2)
+        return x_out.to(x.dtype)
     x_out = torch.view_as_complex(x.to(torch.float64).reshape(
         x.shape[0], x.shape[1], x.shape[2], -1, 2))
     x_out = torch.view_as_real(x_out * freqs).flatten(2)
@@ -483,7 +532,7 @@ class SelfAttention(nn.Module):
             self.local_attn_mask_w = w//8
             self.local_range = local_range
         attn_mode = _resolve_attention_mode()
-        use_block_sparse = attn_mode == "block_sparse_attention" and BLOCK_ATTN_AVAILABLE
+        use_block_sparse = (attn_mode == "block_sparse_attention" and BLOCK_ATTN_AVAILABLE) or attn_mode == "triton_block_sparse_attention"
         if attn_mode == "block_sparse_attention" and not BLOCK_ATTN_AVAILABLE:
             _warn_attention_once(
                 "Requested block_sparse_attention, but block_sparse_attn is unavailable; "
@@ -600,8 +649,17 @@ class DiTBlock(nn.Module):
 
         x = self.gate(x, gate_msa, self_attn_output)
         x = x + self.cross_attn(self.norm3(x), context, is_stream=is_stream)
-        input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
-        x = self.gate(x, gate_mlp, self.ffn(input_x))
+        chunk = ffn_chunk_tokens(x.shape[1])
+        if chunk:
+            # The 8960-wide FFN hidden slab is the largest transient at 4K; tokens are independent,
+            # so slabs of `chunk` tokens give the same result with a bounded workspace.
+            ffn_out = torch.empty_like(x)
+            for start in range(0, x.shape[1], chunk):
+                stop = min(start + chunk, x.shape[1])
+                ffn_out[:, start:stop] = self.ffn(modulate(self.norm2(x[:, start:stop]), shift_mlp, scale_mlp))
+        else:
+            ffn_out = self.ffn(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        x = self.gate(x, gate_mlp, ffn_out)
         if is_stream:
             return x, self_attn_cache_k, self_attn_cache_v
         return x

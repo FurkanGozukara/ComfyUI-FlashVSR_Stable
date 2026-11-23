@@ -492,6 +492,26 @@ class VideoReader:
     def get_info(self):
         return self.fps, self.total_frames
 
+# SECourses app (V10.5+): the FFmpeg video arguments the app checked for this run, a JSON list from -c:v on
+# (NVIDIA NVENC). When present they replace codec / preset / CRF / pixel format / tuning of the ffmpeg writer.
+APP_VIDEO_ARGS_ENV = 'SECOURSES_FFMPEG_VIDEO_ARGS'
+
+
+def _app_video_args():
+    import json as _json
+
+    raw = str(os.environ.get(APP_VIDEO_ARGS_ENV, '') or '').strip()
+    if not raw:
+        return None
+    try:
+        value = _json.loads(raw)
+    except Exception:
+        return None
+    if isinstance(value, list) and value and all(isinstance(v, str) for v in value):
+        return value
+    return None
+
+
 class VideoWriter:
     """
     Incremental video writer.
@@ -574,22 +594,30 @@ class VideoWriter:
                 '-i',
                 '-',
                 '-an',
-                '-c:v',
-                self.codec,
-                '-preset',
-                self.video_preset,
-                '-crf',
-                str(self.crf),
-                '-pix_fmt',
-                self.pixel_format,
             ]
-            if self.codec == 'libx265' and self.h265_tune != 'none':
-                ffmpeg_cmd.extend(['-tune', self.h265_tune])
-            if self.codec in {'libsvtav1', 'libaom-av1'}:
+            app_args = _app_video_args()
+            if app_args:
+                # SECourses app (V10.5+): encoder arguments it checked for this run (NVIDIA NVENC).
+                ffmpeg_cmd.extend(app_args)
+                self.codec = app_args[app_args.index('-c:v') + 1] if '-c:v' in app_args[:-1] else self.codec
+            else:
                 ffmpeg_cmd.extend([
-                    '-svtav1-params',
-                    f'film-grain={self.av1_film_grain}:film-grain-denoise={1 if self.av1_film_grain_denoise else 0}',
+                    '-c:v',
+                    self.codec,
+                    '-preset',
+                    self.video_preset,
+                    '-crf',
+                    str(self.crf),
+                    '-pix_fmt',
+                    self.pixel_format,
                 ])
+                if self.codec == 'libx265' and self.h265_tune != 'none':
+                    ffmpeg_cmd.extend(['-tune', self.h265_tune])
+                if self.codec in {'libsvtav1', 'libaom-av1'}:
+                    ffmpeg_cmd.extend([
+                        '-svtav1-params',
+                        f'film-grain={self.av1_film_grain}:film-grain-denoise={1 if self.av1_film_grain_denoise else 0}',
+                    ])
             ffmpeg_cmd.append(output_path)
             try:
                 self.proc = subprocess.Popen(

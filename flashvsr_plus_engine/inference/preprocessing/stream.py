@@ -97,3 +97,30 @@ class TemporalVideoStream:
             close()
         self.buffer = None
         self.last_frame = None
+
+
+class ResidentVideoStream(TemporalVideoStream):
+    """Serve views of prepared GPU frames for the 4:1 temporal path."""
+
+    def __init__(self, video: torch.Tensor, compression: int):
+        super().__init__(iter(()), compression)
+        if self.repeat_factor != 1 or video.shape[2] == 0:
+            raise ValueError("Resident input requires nonempty video at native temporal compression")
+        self.buffer = video
+        self.source_frames = video.shape[2]
+        self.effective_frames = target_frame_count(self.source_frames, self.compression)
+        self.expanded_frames = self.effective_frames
+        self.eof = True
+
+    def window(self, start: int, stop: int) -> torch.Tensor:
+        if start < 0 or stop <= start:
+            raise ValueError("Invalid resident input frame window")
+        frames = self.buffer[:, :, start:stop]
+        missing = stop - start - frames.shape[2]
+        if missing:
+            tail = self.buffer[:, :, -1:].expand(-1, -1, missing, -1, -1)
+            return torch.cat((frames, tail), dim=2)
+        return frames
+
+    def release_before(self, frame: int) -> None:
+        pass  # All windows share one resident allocation.

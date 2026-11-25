@@ -327,10 +327,17 @@ class PlusEngine:
         self.bundle = build_model_bundle(self.config, ModelPaths(
             dit=str(self.paths["dit"]), lq_projection=str(self.paths["lq"]), context=str(self.paths["prompt"]),
             tiny_decoder=str(self.paths["tcd"])), factories)
+        self.fp8_enabled = False
         if args.precision == "int8_convrot":
             from src.models.int8_convrot_dit import set_int8_onload_device
 
             set_int8_onload_device(self.bundle.denoiser, device)
+            if getattr(args, "plus_fp8_weights", False):
+                _log("[FlashVSR+] FP8 requires BF16 source weights. Using the selected INT8 ConvRot weights.")
+        elif getattr(args, "plus_fp8_weights", False):
+            from shared.fp8_linear import convert_fp8_blocks
+
+            self.fp8_enabled = bool(convert_fp8_blocks(self.bundle.denoiser.blocks, device, dtype, _log))
         if os.environ.get("SECOURSES_INT8_CALIBRATE", "").strip().lower() in {"1", "true", "yes", "on"} \
                 and args.precision != "int8_convrot":
             from src.models.int8_calibration import maybe_start_calibration
@@ -430,6 +437,8 @@ class PlusEngine:
         tokens = 4 * (th // 16) * (tw // 16)
         if req > 0:
             return req if tokens > req else None
+        if self.fp8_enabled and tokens > 32768:
+            return 8192
         return 32768 if tokens > 65536 else None  # auto: bound the 8960-wide FFN slab at 4K
 
     def _count_steps(self, total: Optional[int]):
@@ -451,9 +460,10 @@ class PlusEngine:
 
     # -- untiled: one stream over the whole clip -------------------------------------------------
     def run_stream(self, reader_factory, write: Callable[[torch.Tensor], None], total_frames: int,
-                   kv_mode: str) -> int:
+                   kv_mode: str, use_resident: bool = False) -> int:
         from flashvsr_plus_engine.inference.config import TEMPORAL_DOWNSAMPLE
         from flashvsr_plus_engine.inference.preprocessing import TemporalVideoStream
+        from flashvsr_plus_engine.inference.preprocessing.stream import ResidentVideoStream
 
         geo = {}
         scale = int(self.args.scale)
@@ -480,6 +490,29 @@ class PlusEngine:
         runner, cfg = self._runner(decode_every=int(self.args.decode_every), kv_mode=kv_mode,
                                    ffn_chunk=self._ffn_chunk(th, tw))
         stream = TemporalVideoStream(all_chunks(), cfg.temporal_compression, TEMPORAL_DOWNSAMPLE)
+        if use_resident and total_frames > 0 and cfg.temporal_compression == TEMPORAL_DOWNSAMPLE:
+            device = torch.device(self.device)
+            free = torch.cuda.mem_get_info(device)[0]
+            limit = float(os.environ.get("SECOURSES_VRAM_LIMIT_GB") or 0)
+            if limit > 0:
+                free = min(free, limit * 1024**3 - torch.cuda.memory_reserved(device))
+            needed = 3 * total_frames * th * tw * first.element_size()
+            if needed <= 0.25 * free:
+                resident = torch.empty((1, 3, total_frames, th, tw), dtype=first.dtype, device=device)
+                offset = 0
+                for chunk in all_chunks():
+                    stop = offset + chunk.shape[2]
+                    if stop > total_frames:
+                        raise RuntimeError("Decoded frame count exceeds the reported resident input size")
+                    resident[:, :, offset:stop].copy_(chunk)
+                    offset = stop
+                stream.close()
+                stream = ResidentVideoStream(resident[:, :, :offset], cfg.temporal_compression)
+                _log(f"[FlashVSR+] Resident input: {offset} frames, {needed / 1024**3:.2f} GiB")
+            else:
+                _log("[FlashVSR+] Resident input exceeds the VRAM budget. Using streaming input.")
+        elif use_resident:
+            _log("[FlashVSR+] Resident input needs a known frame count and Temporal Compression 4. Using streaming input.")
         steps = None
         if total_frames and total_frames > 0:
             tc = cfg.temporal_compression
@@ -595,6 +628,9 @@ def run_plus(args, VideoReader, make_writer, output_fps: float, total_frames: in
         return VideoReader(args.input, start_frame=args.start_frame, end_frame=args.end_frame, chunk_size=chunk)
 
     tiled = bool(args.tiled_dit)
+    use_resident = bool(getattr(args, "plus_resident_frames", False))
+    if tiled and use_resident:
+        _log("[FlashVSR+] Resident input is available for untiled clips. Using tiled input.")
     tile, overlap = int(args.tile_size), int(args.tile_overlap)
     kv_mode = args.plus_kv_offload
     chunk_frames = int(args.frame_chunk_size) if int(args.frame_chunk_size) > 0 else 241
@@ -608,7 +644,7 @@ def run_plus(args, VideoReader, make_writer, output_fps: float, total_frames: in
             if tiled:
                 produced = engine.run_tiled(reader_factory, write, tile, overlap, chunk_frames, kv_mode)
             else:
-                produced = engine.run_stream(reader_factory, write, total_frames, kv_mode)
+                produced = engine.run_stream(reader_factory, write, total_frames, kv_mode, use_resident)
             error = None
             break
         except Exception as e:  # noqa: BLE001 - out-of-memory is retried below, anything else is reported
@@ -633,6 +669,10 @@ def run_plus(args, VideoReader, make_writer, output_fps: float, total_frames: in
                     pass
             gc.collect()
             torch.cuda.empty_cache()
+            if use_resident and not tiled and not disable_recovery:
+                use_resident = False
+                _log("[FlashVSR+] VRAM limit reached. Restarting with streaming input.")
+                continue
             step = None if disable_recovery else oom_ladder(tiled, tile, overlap, kv_mode)
             if step is None:
                 _log("Still out of memory at the smallest tiles. Cannot recover.")

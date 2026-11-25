@@ -393,6 +393,10 @@ For more information, visit: https://github.com/naxci1/ComfyUI-FlashVSR_Stable
         help='Custom path to FlashVSR models directory. If not set, uses ComfyUI default or ./models'
     )
 
+    parser.add_argument("--plus_resident_frames", action="store_true", help="Use a VRAM-resident input buffer when it fits")
+    parser.add_argument("--plus_fp8_weights", action="store_true", help="Try FP8 linear layers with a supported GPU")
+    parser.add_argument("--legacy_tiled_stream", action="store_true",
+                        help="For the legacy Tiny models, process overlapping temporal windows with spatial tiling")
     return parser.parse_args()
 
 
@@ -954,6 +958,13 @@ def main():
     # Load input video (Lazily)
     # ==========================================================================
     print("\nInitializing Video Reader...")
+    legacy_stream = bool(args.legacy_tiled_stream)
+    if legacy_stream:
+        if args.mode not in {"tiny", "tiny-long"}:
+            raise ValueError("Legacy tiled streaming requires Tiny or Tiny-long mode.")
+        args.tiled_dit = True
+        args.frame_chunk_size = min(25, max(9, int(args.frame_chunk_size or 25)))
+        print(f"Legacy tiled streaming: {args.frame_chunk_size} input frames per window, 4-frame overlap")
     reader = VideoReader(
         args.input, 
         start_frame=args.start_frame, 
@@ -1026,6 +1037,8 @@ def main():
     total_processed = 0
     start_time_glob = 0
     processing_error = None
+    input_tail = None
+    output_tail = None
     stream_decode_enabled = (args.mode in {"tiny", "tiny-long"}) and (not args.tiled_dit)
     if stream_decode_enabled:
         print("Streaming decode enabled: writing decoded frame groups incrementally for lower peak memory.")
@@ -1037,6 +1050,10 @@ def main():
         for chunk_idx, frames in enumerate(reader):
             chunk_no = int(chunk_idx) + 1
             chunk_frames_in = int(frames.shape[0]) if hasattr(frames, "shape") else -1
+            if legacy_stream:
+                if input_tail is not None:
+                    frames = torch.cat((input_tail, frames), dim=0)
+                input_tail = frames[-4:].clone()
             print(f"[Chunk {chunk_no}] inference start: input_frames={chunk_frames_in}")
             # Calculate progress metrics
             elapsed = time.time() - start_time_glob
@@ -1176,9 +1193,22 @@ def main():
 
                 # Write frames
                 print(f"[Chunk {chunk_no}] write start")
-                writer.write(output_frames)
+                if legacy_stream:
+                    if output_frames.shape[0] != frames.shape[0]:
+                        raise RuntimeError("Tiled window output did not preserve the source frame count.")
+                    if output_tail is not None:
+                        overlap = output_tail.shape[0]
+                        weight = torch.arange(1, overlap + 1, dtype=output_frames.dtype,
+                                              device=output_frames.device).view(-1, 1, 1, 1) / (overlap + 1)
+                        output_frames[:overlap] = torch.lerp(output_tail, output_frames[:overlap], weight)
+                    carry = min(4, output_frames.shape[0])
+                    if output_frames.shape[0] > carry:
+                        writer.write(output_frames[:-carry])
+                    output_tail = output_frames[-carry:].clone()
+                else:
+                    writer.write(output_frames)
                 print(f"[Chunk {chunk_no}] write done")
-            total_processed += frames.shape[0]
+            total_processed += chunk_frames_in
             
             # Cleanup
             if stream_decode_enabled:
@@ -1188,6 +1218,8 @@ def main():
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+        if output_tail is not None:
+            writer.write(output_tail)
                 
     except StopIteration:
         pass
